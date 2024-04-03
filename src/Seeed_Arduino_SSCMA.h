@@ -232,6 +232,8 @@ private:
     StaticJsonDocument<2048> response; // for json response
 #endif
 
+    uint32_t _count;
+
     String _image = "";
     String _info = "";
 
@@ -273,6 +275,8 @@ public:
     char *ID(bool cache = true);
     char *name(bool cache = true);
     String info(bool cache = true);
+
+    uint32_t last_count() { return _count; }
 
     String last_image() { return _image; }
 

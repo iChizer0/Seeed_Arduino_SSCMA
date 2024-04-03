@@ -492,6 +492,12 @@ void SSCMA::praser_event()
                 _keypoints.push_back(k);
             }
         }
+
+        if (response["data"].containsKey("count"))
+        {
+            _count = response["data"]["count"];
+        }
+
         if (response["data"].containsKey("image"))
         {
             _image = response["data"]["image"].as<String>();
