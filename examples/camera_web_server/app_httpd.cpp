@@ -589,28 +589,16 @@ static esp_err_t results_handler(httpd_req_t* req) {
         strncpy(rst_buf + copied, img_tail, size);
     }
 
-    res = httpd_resp_set_type(req, "application/json");
-    if (res != ESP_OK) {
-        return res;
-    }
-    res = httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    if (res != ESP_OK) {
-        return res;
-    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
     char ts[32] = {0};
     snprintf(ts, sizeof(ts), "%ld", slot->id);
-    res = httpd_resp_set_hdr(req, "X-Id", (const char*)ts);
-    if (res != ESP_OK) {
-        return res;
-    }
+    httpd_resp_set_hdr(req, "X-Id", (const char*)ts);
 
     memset(ts, 0, sizeof(ts));
     snprintf(ts, sizeof(ts), "%ld.%06ld", slot->timestamp.tv_sec, slot->timestamp.tv_usec);
-    res = httpd_resp_set_hdr(req, "X-Timestamp", (const char*)ts);
-    if (res != ESP_OK) {
-        return res;
-    }
+    httpd_resp_set_hdr(req, "X-Timestamp", (const char*)ts);
 
     size_t  last_frame_id;
     timeval last_frame_timestamp;
@@ -622,17 +610,11 @@ static esp_err_t results_handler(httpd_req_t* req) {
 
     memset(ts, 0, sizeof(ts));
     snprintf(ts, sizeof(ts), "%ld", last_frame_id);
-    res = httpd_resp_set_hdr(req, "X-Last-Frame-Id", (const char*)ts);
-    if (res != ESP_OK) {
-        return res;
-    }
+    httpd_resp_set_hdr(req, "X-Last-Frame-Id", (const char*)ts);
 
     memset(ts, 0, sizeof(ts));
     snprintf(ts, sizeof(ts), "%ld.%06ld", last_frame_timestamp.tv_sec, last_frame_timestamp.tv_usec);
-    res = httpd_resp_set_hdr(req, "X-Last-Frame-Timestamp", (const char*)ts);
-    if (res != ESP_OK) {
-        return res;
-    }
+    httpd_resp_set_hdr(req, "X-Last-Frame-Timestamp", (const char*)ts);
 
     res = httpd_resp_send(req, (const char*)rst_buf, strlen(rst_buf));
     if (res != ESP_OK) {
