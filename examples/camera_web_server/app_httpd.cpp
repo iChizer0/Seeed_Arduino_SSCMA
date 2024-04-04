@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Modified by Seeed Technology Inc. (c) 2024
+// Modified by Seeed Technology Inc, nullptr (c) 2024
 //
 
 #include <FreeRTOS.h>
@@ -741,6 +741,7 @@ static esp_err_t stream_handler(httpd_req_t* req) {
     SendError:
         log_e("Send frame failed...");
         break;
+
     }
 
     free(jpeg_buf);
