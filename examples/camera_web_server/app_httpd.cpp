@@ -110,7 +110,6 @@ inline uint16_t getCmdType(const char* resp, size_t len) {
         type |= CMD_TYPE_SENSOR;
     } else {
         log_w("Unknown command type...");
-        return;
     }
 
     return type;
@@ -742,7 +741,7 @@ static esp_err_t stream_handler(httpd_req_t* req) {
 
         if (res == ESP_OK) {
             memset(part_buf, 0, sizeof(part_buf));
-            size_t hlen = snprintf((char*)part_buf, sizeof(part_buf), _STREAM_PART, size, slot->timestamp.tv_sec, slot->timestamp.tv_usec);
+            size_t hlen = snprintf((char*)part_buf, sizeof(part_buf), _STREAM_PART, jpeg_size, slot->timestamp.tv_sec, slot->timestamp.tv_usec);
             res         = httpd_resp_send_chunk(req, (const char*)part_buf, hlen);
         }
 
