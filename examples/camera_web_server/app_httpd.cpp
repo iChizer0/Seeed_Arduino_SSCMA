@@ -38,25 +38,30 @@
 #endif
 
 #define PTR_BUFFER_SIZE 8
+#define JPG_BUFFER_SIZE (1024 * 256)
 
 #define MSG_IMAGE_KEY   "\"image\": "
 #define MSG_COMMA_STR   "\""
 #define MSG_REPLY_STR   "\"type\": 0"
 #define MSG_EVENT_STR   "\"type\": 1"
+#define MSG_LOGGI_STR   "\"type\": 2"
 
 enum MsgType : uint16_t {
     MSG_TYPE_UNKNOWN = 0,
     MSG_TYPE_REPLY   = 0xff & 1,
     MSG_TYPE_EVENT   = 0xff & 2,
+    MSG_TYPE_LOGGI   = 0xff & 3,
 };
 
+#define CMD_SAMPLE_STR "SAMPLE"
 #define CMD_INVOKE_STR "INVOKE"
 #define CMD_SENSOR_STR "SENSOR"
 
 enum CmdType : uint16_t {
     CMD_TYPE_UNKNOWN = 0,
-    CMD_TYPE_INVOKE  = 0xff00 & (1 << 8),
-    CMD_TYPE_SENSOR  = 0xff00 & (2 << 8),
+    CMD_TYPE_SAMPLE  = 0xff00 & (1 << 8),
+    CMD_TYPE_INVOKE  = 0xff00 & (2 << 8),
+    CMD_TYPE_SENSOR  = 0xff00 & (3 << 8),
 };
 
 struct PtrBuffer {
@@ -65,6 +70,7 @@ struct PtrBuffer {
         uint16_t type = 0;
         void*    data = NULL;
         size_t   size = 0;
+        timeval  timestamp;
     };
 
     SemaphoreHandle_t                 mutex;
@@ -77,24 +83,28 @@ SSCMA     AI;
 
 void initSharedBuffer() { PB.mutex = xSemaphoreCreateMutex(); }
 
-static void proxyCallback(const char* resp, size_t len) {
-    static size_t id = 0;
+inline uint16_t getMsgType(const char* resp, size_t len) {
+    uint16_t type = MSG_TYPE_UNKNOWN;
 
-    if (!len) {
-        log_i("Response is empty...");
-        return;
-    }
-
-    uint16_t type = 0;
     if (strnstr(resp, MSG_REPLY_STR, len) != NULL) {
         type |= MSG_TYPE_REPLY;
     } else if (strnstr(resp, MSG_EVENT_STR, len) != NULL) {
         type |= MSG_TYPE_EVENT;
+    } else if (strnstr(resp, MSG_LOGGI_STR, len) != NULL) {
+        type |= MSG_TYPE_LOGGI;
     } else {
         log_w("Unknown message type...");
-        return;
     }
-    if (strnstr(resp, CMD_INVOKE_STR, len) != NULL) {
+
+    return type;
+}
+
+inline uint16_t getCmdType(const char* resp, size_t len) {
+    uint16_t type = CMD_TYPE_UNKNOWN;
+
+    if (strnstr(resp, CMD_SAMPLE_STR, len) != NULL) {
+        type |= CMD_TYPE_SAMPLE;
+    } else if (strnstr(resp, CMD_INVOKE_STR, len) != NULL) {
         type |= CMD_TYPE_INVOKE;
     } else if (strnstr(resp, CMD_SENSOR_STR, len) != NULL) {
         type |= CMD_TYPE_SENSOR;
@@ -103,18 +113,48 @@ static void proxyCallback(const char* resp, size_t len) {
         return;
     }
 
+    return type;
+}
+
+static void proxyCallback(const char* resp, size_t len) {
+    static size_t id = 0;
+    static timeval timestamp;
+
+    TickType_t ticks  = xTaskGetTickCount();
+    timestamp.tv_sec  = ticks / configTICK_RATE_HZ;
+    timestamp.tv_usec = (ticks % configTICK_RATE_HZ) * 1e6 / configTICK_RATE_HZ;
+
+    if (!len) {
+        log_i("Response is empty...");
+        return;
+    }
+
+    uint16_t type = 0;
+    type |= getMsgType(resp, len);
+    if (type == MSG_TYPE_UNKNOWN) {
+        return;
+    }
+    type |= getCmdType(resp, len);
+
     char* copy = (char*)malloc(len);
-    assert(copy != NULL);
+    if (copy == NULL) {
+        log_e("Failed to allocate resp copy...");
+        return;
+    }
     memcpy(copy, resp, len);
 
     size_t           limit  = PB.limit;
     PtrBuffer::Slot* p_slot = (PtrBuffer::Slot*)malloc(sizeof(PtrBuffer::Slot));
-    assert(p_slot != NULL);
+    if (p_slot == NULL) {
+        log_e("Failed to allocate slot...");
+        return;
+    }
 
-    p_slot->id   = id++;
-    p_slot->type = type;
-    p_slot->data = copy;
-    p_slot->size = len;
+    p_slot->id        = id++;
+    p_slot->type      = type;
+    p_slot->data      = copy;
+    p_slot->size      = len;
+    p_slot->timestamp = timestamp;
 
     size_t discarded = 0;
     xSemaphoreTake(PB.mutex, portMAX_DELAY);
@@ -135,7 +175,7 @@ static void proxyCallback(const char* resp, size_t len) {
     xSemaphoreGive(PB.mutex);
 
     if (discarded > 0) {
-        log_w("Discarded %u responses...", discarded);
+        log_w("Discarded %u old responses...", discarded);
     }
 
     log_i("Received %u bytes...", len);
@@ -622,38 +662,10 @@ static esp_err_t capture_handler(httpd_req_t* req) {
 }
 
 static esp_err_t stream_handler(httpd_req_t* req) {
-    // camera_fb_t*   fb = NULL;
-    struct timeval _timestamp;
-    esp_err_t      res = ESP_OK;
-    // size_t         _jpg_buf_len = 0;
-    // uint8_t*       _jpg_buf     = NULL;
-    char* part_buf[128] = {0};
-    // #if CONFIG_ESP_FACE_DETECT_ENABLED
-    //     #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-    //     bool    detected     = false;
-    //     int64_t fr_ready     = 0;
-    //     int64_t fr_recognize = 0;
-    //     int64_t fr_encode    = 0;
-    //     int64_t fr_face      = 0;
-    //     int64_t fr_start     = 0;
-    //     #endif
-    //     int      face_id = 0;
-    //     size_t   out_len = 0, out_width = 0, out_height = 0;
-    //     uint8_t* out_buf = NULL;
-    //     bool     s       = false;
-    //     #if TWO_STAGE
-    //     HumanFaceDetectMSR01 s1(0.1F, 0.5F, 10, 0.2F);
-    //     HumanFaceDetectMNP01 s2(0.5F, 0.3F, 5);
-    //     #else
-    //     HumanFaceDetectMSR01 s1(0.3F, 0.5F, 10, 0.2F);
-    //     #endif
-    // #endif
-    size_t last_id = -0;
-
-    static int64_t last_frame = 0;
-    if (!last_frame) {
-        last_frame = esp_timer_get_time();
-    }
+    esp_err_t res      = ESP_OK;
+    char*     part_buf[128];
+    char*     jpeg_buf = NULL;
+    size_t    last_id  = -1;
 
     res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
     if (res != ESP_OK) {
@@ -663,15 +675,13 @@ static esp_err_t stream_handler(httpd_req_t* req) {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "X-Framerate", "60");
 
-    // #if CONFIG_LED_ILLUMINATOR_ENABLED
-    //     isStreaming = true;
-    //     enable_led(true);
-    // #endif
+    jpeg_buf = (char*)malloc(JPG_BUFFER_SIZE);
+    if (jpeg_buf == NULL) {
+        log_e("Failed to allocate jpeg buffer...");
+        return ESP_ERR_NO_MEM;
+    }
 
     while (true) {
-        TickType_t ticks   = xTaskGetTickCount();
-        _timestamp.tv_sec  = ticks / configTICK_RATE_HZ;
-        _timestamp.tv_usec = (ticks % configTICK_RATE_HZ) * 1e6 / configTICK_RATE_HZ;
 
         std::shared_ptr<PtrBuffer::Slot> slot;
 
@@ -681,7 +691,7 @@ static esp_err_t stream_handler(httpd_req_t* req) {
             xSemaphoreGive(PB.mutex);
 
             auto it = std::find_if(slots.rbegin(), slots.rend(), [](std::shared_ptr<PtrBuffer::Slot> p) {
-                return p->type == (MSG_TYPE_EVENT | CMD_TYPE_INVOKE);
+                return p->type == (MSG_TYPE_EVENT | CMD_TYPE_SAMPLE) || p->type == (MSG_TYPE_EVENT | CMD_TYPE_INVOKE);
             });
             if (it == slots.rend() || it->get()->id == last_id) {
                 vTaskDelay(10 / portTICK_PERIOD_MS);
@@ -707,7 +717,7 @@ static esp_err_t stream_handler(httpd_req_t* req) {
         const char* data  = (const char*)slot->data + offset;
         const char* quote = strnstr(data, MSG_COMMA_STR, slot->size - offset);
         if (quote == NULL) {
-            log_w("Invalid image data...");
+            log_w("Invalid image data size...");
             vTaskDelay(10 / portTICK_PERIOD_MS);
             continue;
         }
@@ -718,245 +728,36 @@ static esp_err_t stream_handler(httpd_req_t* req) {
             continue;
         }
 
-        size_t size   = len;
-        char*  buffer = (char*)malloc(size);
-        if (buffer == NULL) {
-            log_e("Failed to allocate memory for image data...");
-            vTaskDelay(10 / portTICK_PERIOD_MS);
-            continue;
-        }
-
-        if (mbedtls_base64_decode((unsigned char*)buffer, size, &size, (const unsigned char*)data, len) != 0) {
+        size_t jpeg_size = 0;
+        memset(jpeg_buf, 0, JPG_BUFFER_SIZE);
+        if (mbedtls_base64_decode((unsigned char*)jpeg_buf, JPG_BUFFER_SIZE, &jpeg_size, (const unsigned char*)data, len) != 0) {
             log_e("Failed to decode image data...");
-            free(buffer);
             vTaskDelay(10 / portTICK_PERIOD_MS);
             continue;
         }
 
-        // #if CONFIG_ESP_FACE_DETECT_ENABLED
-        //     #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        //         detected = false;
-        //     #endif
-        //         face_id = 0;
-        // #endif
-
-        //         fb = esp_camera_fb_get();
-        //         if (!fb) {
-        //             log_e("Camera capture failed");
-        //             res = ESP_FAIL;
-        //         } else {
-        //             _timestamp.tv_sec  = fb->timestamp.tv_sec;
-        //             _timestamp.tv_usec = fb->timestamp.tv_usec;
-        // #if CONFIG_ESP_FACE_DETECT_ENABLED
-        //     #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        //             fr_start     = esp_timer_get_time();
-        //             fr_ready     = fr_start;
-        //             fr_encode    = fr_start;
-        //             fr_recognize = fr_start;
-        //             fr_face      = fr_start;
-        //     #endif
-        //             if (!detection_enabled || fb->width > 400) {
-        // #endif
-        //                 if (fb->format != PIXFORMAT_JPEG) {
-        //                     bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
-        //                     esp_camera_fb_return(fb);
-        //                     fb = NULL;
-        //                     if (!jpeg_converted) {
-        //                         log_e("JPEG compression failed");
-        //                         res = ESP_FAIL;
-        //                     }
-        //                 } else {
-        //                     _jpg_buf_len = fb->len;
-        //                     _jpg_buf     = fb->buf;
-        //                 }
-        // #if CONFIG_ESP_FACE_DETECT_ENABLED
-        //             } else {
-        //                 if (fb->format == PIXFORMAT_RGB565
-        //     #if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-        //                     && !recognition_enabled
-        //     #endif
-        //                 ) {
-        //     #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        //                     fr_ready = esp_timer_get_time();
-        //     #endif
-        //     #if TWO_STAGE
-        //                     std::list<dl::detect::result_t>& candidates =
-        //                       s1.infer((uint16_t*)fb->buf, {(int)fb->height, (int)fb->width, 3});
-        //                     std::list<dl::detect::result_t>& results =
-        //                       s2.infer((uint16_t*)fb->buf, {(int)fb->height, (int)fb->width, 3}, candidates);
-        //     #else
-        //                     std::list<dl::detect::result_t>& results =
-        //                       s1.infer((uint16_t*)fb->buf, {(int)fb->height, (int)fb->width, 3});
-        //     #endif
-        //     #if CONFIG_ESP_FACE_DETECT_ENABLED && ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        //                     fr_face      = esp_timer_get_time();
-        //                     fr_recognize = fr_face;
-        //     #endif
-        //                     if (results.size() > 0) {
-        //                         fb_data_t rfb;
-        //                         rfb.width           = fb->width;
-        //                         rfb.height          = fb->height;
-        //                         rfb.data            = fb->buf;
-        //                         rfb.bytes_per_pixel = 2;
-        //                         rfb.format          = FB_RGB565;
-        //     #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        //                         detected = true;
-        //     #endif
-        //                         draw_face_boxes(&rfb, &results, face_id);
-        //                     }
-        //                     s =
-        //                       fmt2jpg(fb->buf, fb->len, fb->width, fb->height, PIXFORMAT_RGB565, 80, &_jpg_buf, &_jpg_buf_len);
-        //                     esp_camera_fb_return(fb);
-        //                     fb = NULL;
-        //                     if (!s) {
-        //                         log_e("fmt2jpg failed");
-        //                         res = ESP_FAIL;
-        //                     }
-        //     #if CONFIG_ESP_FACE_DETECT_ENABLED && ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        //                     fr_encode = esp_timer_get_time();
-        //     #endif
-        //                 } else {
-        //                     out_len    = fb->width * fb->height * 3;
-        //                     out_width  = fb->width;
-        //                     out_height = fb->height;
-        //                     out_buf    = (uint8_t*)malloc(out_len);
-        //                     if (!out_buf) {
-        //                         log_e("out_buf malloc failed");
-        //                         res = ESP_FAIL;
-        //                     } else {
-        //                         s = fmt2rgb888(fb->buf, fb->len, fb->format, out_buf);
-        //                         esp_camera_fb_return(fb);
-        //                         fb = NULL;
-        //                         if (!s) {
-        //                             free(out_buf);
-        //                             log_e("To rgb888 failed");
-        //                             res = ESP_FAIL;
-        //                         } else {
-        //     #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        //                             fr_ready = esp_timer_get_time();
-        //     #endif
-
-        //                             fb_data_t rfb;
-        //                             rfb.width           = out_width;
-        //                             rfb.height          = out_height;
-        //                             rfb.data            = out_buf;
-        //                             rfb.bytes_per_pixel = 3;
-        //                             rfb.format          = FB_BGR888;
-
-        //     #if TWO_STAGE
-        //                             std::list<dl::detect::result_t>& candidates =
-        //                               s1.infer((uint8_t*)out_buf, {(int)out_height, (int)out_width, 3});
-        //                             std::list<dl::detect::result_t>& results =
-        //                               s2.infer((uint8_t*)out_buf, {(int)out_height, (int)out_width, 3}, candidates);
-        //     #else
-        //                             std::list<dl::detect::result_t>& results =
-        //                               s1.infer((uint8_t*)out_buf, {(int)out_height, (int)out_width, 3});
-        //     #endif
-
-        //     #if CONFIG_ESP_FACE_DETECT_ENABLED && ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        //                             fr_face      = esp_timer_get_time();
-        //                             fr_recognize = fr_face;
-        //     #endif
-
-        //                             if (results.size() > 0) {
-        //     #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        //                                 detected = true;
-        //     #endif
-        //     #if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-        //                                 if (recognition_enabled) {
-        //                                     face_id = run_face_recognition(&rfb, &results);
-        //         #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        //                                     fr_recognize = esp_timer_get_time();
-        //         #endif
-        //                                 }
-        //     #endif
-        //                                 draw_face_boxes(&rfb, &results, face_id);
-        //                             }
-        //                             s = fmt2jpg(
-        //                               out_buf, out_len, out_width, out_height, PIXFORMAT_RGB888, 90, &_jpg_buf, &_jpg_buf_len);
-        //                             free(out_buf);
-        //                             if (!s) {
-        //                                 log_e("fmt2jpg failed");
-        //                                 res = ESP_FAIL;
-        //                             }
-        //     #if CONFIG_ESP_FACE_DETECT_ENABLED && ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        //                             fr_encode = esp_timer_get_time();
-        //     #endif
-        //                         }
-        //                     }
-        //                 }
-        //             }
-        // #endif
-        //         }
         if (res == ESP_OK) {
             res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
         }
 
         if (res == ESP_OK) {
-            size_t hlen = snprintf((char*)part_buf, 128, _STREAM_PART, size, _timestamp.tv_sec, _timestamp.tv_usec);
+            memset(part_buf, 0, sizeof(part_buf));
+            size_t hlen = snprintf((char*)part_buf, sizeof(part_buf), _STREAM_PART, size, slot->timestamp.tv_sec, slot->timestamp.tv_usec);
             res         = httpd_resp_send_chunk(req, (const char*)part_buf, hlen);
         }
 
         if (res == ESP_OK) {
-            res = httpd_resp_send_chunk(req, buffer, size);
+            res = httpd_resp_send_chunk(req, jpeg_buf, jpeg_size);
         }
 
-        free(buffer);
-
-        // if (fb) {
-        //     esp_camera_fb_return(fb);
-        //     fb       = NULL;
-        //     _jpg_buf = NULL;
-        // } else if (_jpg_buf) {
-        //     free(_jpg_buf);
-        //     _jpg_buf = NULL;
-        // }
         if (res != ESP_OK) {
             log_e("Send frame failed");
             break;
         }
-        int64_t fr_end = esp_timer_get_time();
 
-        // #if CONFIG_ESP_FACE_DETECT_ENABLED && ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        //         int64_t ready_time     = (fr_ready - fr_start) / 1000;
-        //         int64_t face_time      = (fr_face - fr_ready) / 1000;
-        //         int64_t recognize_time = (fr_recognize - fr_face) / 1000;
-        //         int64_t encode_time    = (fr_encode - fr_recognize) / 1000;
-        //         int64_t process_time   = (fr_encode - fr_start) / 1000;
-        // #endif
-
-        //         int64_t frame_time = fr_end - last_frame;
-        //         frame_time /= 1000;
-        // #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        //         uint32_t avg_frame_time = ra_filter_run(&ra_filter, frame_time);
-        // #endif
-        //         log_i("MJPG: %uB %ums (%.1ffps), AVG: %ums (%.1ffps)"
-        // #if CONFIG_ESP_FACE_DETECT_ENABLED
-        //               ", %u+%u+%u+%u=%u %s%d"
-        // #endif
-        //               ,
-        //               (uint32_t)(_jpg_buf_len),
-        //               (uint32_t)frame_time,
-        //               1000.0 / (uint32_t)frame_time,
-        //               avg_frame_time,
-        //               1000.0 / avg_frame_time
-        // #if CONFIG_ESP_FACE_DETECT_ENABLED
-        //               ,
-        //               (uint32_t)ready_time,
-        //               (uint32_t)face_time,
-        //               (uint32_t)recognize_time,
-        //               (uint32_t)encode_time,
-        //               (uint32_t)process_time,
-        //               (detected) ? "DETECTED " : "",
-        //               face_id
-        // #endif
-        //         );
     }
 
-    // #if CONFIG_LED_ILLUMINATOR_ENABLED
-    //     isStreaming = false;
-    //     enable_led(false);
-    // #endif
+    free(jpeg_buf);
 
     return res;
 }
