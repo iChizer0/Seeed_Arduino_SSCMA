@@ -41,6 +41,7 @@ const char* ssid     = "AP";
 const char* password = "31415926";
 
 void initSharedBuffer();
+void initStatInfo();
 
 void startRemoteProxy();
 void startCameraServer();
@@ -51,6 +52,7 @@ void loopRemoteProxy();
 
 void setup() {
     initSharedBuffer();
+    initStatInfo();
 
     Serial.begin(115200);
     Serial.setDebugOutput(true);

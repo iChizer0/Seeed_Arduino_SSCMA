@@ -37,11 +37,15 @@
     #include "esp32-hal-log.h"
 #endif
 
+#define RESULT_TIMEOUT_MS 3000
+
 #define PTR_BUFFER_SIZE 8
-#define JPG_BUFFER_SIZE (1024 * 256)
+#define JPG_BUFFER_SIZE (1024 * 128)
+#define RST_BUFFER_SIZE (1024 * 128)
 
 #define MSG_IMAGE_KEY   "\"image\": "
-#define MSG_COMMA_STR   "\""
+#define MSG_COMMA_STR   ", "
+#define MSG_QUOTE_STR   "\""
 #define MSG_REPLY_STR   "\"type\": 0"
 #define MSG_EVENT_STR   "\"type\": 1"
 #define MSG_LOGGI_STR   "\"type\": 2"
@@ -78,10 +82,26 @@ struct PtrBuffer {
     const size_t                      limit = PTR_BUFFER_SIZE;
 };
 
+struct StatInfo {
+    size_t            last_frame_id = 0;
+    timeval           last_frame_timestamp;
+    SemaphoreHandle_t mutex;
+};
+
 PtrBuffer PB;
+StatInfo  SI;
 SSCMA     AI;
 
-void initSharedBuffer() { PB.mutex = xSemaphoreCreateMutex(); }
+void initSharedBuffer() { 
+    PB.mutex = xSemaphoreCreateMutex();
+}
+
+void initStatInfo() {
+    SI.mutex                        = xSemaphoreCreateMutex();
+    TickType_t ticks                = xTaskGetTickCount();
+    SI.last_frame_timestamp.tv_sec  = ticks / configTICK_RATE_HZ;
+    SI.last_frame_timestamp.tv_usec = (ticks % configTICK_RATE_HZ) * 1e6 / configTICK_RATE_HZ;
+}
 
 inline uint16_t getMsgType(const char* resp, size_t len) {
     uint16_t type = MSG_TYPE_UNKNOWN;
@@ -492,179 +512,141 @@ static size_t jpg_encode_stream(void* arg, size_t index, const void* data, size_
     return len;
 }
 
-static esp_err_t capture_handler(httpd_req_t* req) {
-    camera_fb_t* fb  = NULL;
-    esp_err_t    res = ESP_OK;
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-    int64_t fr_start = esp_timer_get_time();
-#endif
-
-#if CONFIG_LED_ILLUMINATOR_ENABLED
-    enable_led(true);
-    vTaskDelay(150 /
-               portTICK_PERIOD_MS);  // The LED needs to be turned on ~150ms before the call to esp_camera_fb_get()
-    fb = esp_camera_fb_get();        // or it won't be visible in the frame. A better way to do this is needed.
-    enable_led(false);
-#else
-    fb = esp_camera_fb_get();
-#endif
-
-    if (!fb) {
-        log_e("Camera capture failed");
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
+static esp_err_t results_handler(httpd_req_t* req) { 
+    esp_err_t     res      = ESP_OK;
+    static size_t last_id  = -1;
+    static char*  hdr_buf[128];
+    static char*  rst_buf = NULL;
+    if (rst_buf == NULL) {
+        rst_buf = (char*)malloc(RST_BUFFER_SIZE);
+        if (rst_buf == NULL) {
+            log_e("Failed to allocate results buffer...");
+            httpd_resp_send_500(req);
+            return ESP_ERR_NO_MEM;
+        }
     }
 
-    httpd_resp_set_type(req, "image/jpeg");
-    httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    std::shared_ptr<PtrBuffer::Slot> slot = nullptr;
 
-    char ts[32];
-    snprintf(ts, 32, "%ld.%06ld", fb->timestamp.tv_sec, fb->timestamp.tv_usec);
-    httpd_resp_set_hdr(req, "X-Timestamp", (const char*)ts);
+    TickType_t time_begin = xTaskGetTickCount();
+    while ((xTaskGetTickCount() - time_begin) < RESULT_TIMEOUT_MS) {
+        xSemaphoreTake(PB.mutex, portMAX_DELAY);
+        auto slots = PB.slots;
+        xSemaphoreGive(PB.mutex);
 
-#if CONFIG_ESP_FACE_DETECT_ENABLED
-    size_t   out_len, out_width, out_height;
-    uint8_t* out_buf;
-    bool     s;
-    #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-    bool detected = false;
-    #endif
-    int face_id = 0;
-    if (!detection_enabled || fb->width > 400) {
-#endif
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        size_t fb_len = 0;
-#endif
-        if (fb->format == PIXFORMAT_JPEG) {
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-            fb_len = fb->len;
-#endif
-            res = httpd_resp_send(req, (const char*)fb->buf, fb->len);
-        } else {
-            jpg_chunking_t jchunk = {req, 0};
-            res                   = frame2jpg_cb(fb, 80, jpg_encode_stream, &jchunk) ? ESP_OK : ESP_FAIL;
-            httpd_resp_send_chunk(req, NULL, 0);
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-            fb_len = jchunk.len;
-#endif
+        auto it = std::find_if(slots.rbegin(), slots.rend(), [](std::shared_ptr<PtrBuffer::Slot> p) {
+            return p->type == (MSG_TYPE_EVENT | CMD_TYPE_SAMPLE) || p->type == (MSG_TYPE_EVENT | CMD_TYPE_INVOKE);
+        });
+        if (it == slots.rend() || it->get()->id == last_id) {
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+            continue;
         }
-        esp_camera_fb_return(fb);
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        int64_t fr_end = esp_timer_get_time();
-#endif
-        log_i("JPG: %uB %ums", (uint32_t)(fb_len), (uint32_t)((fr_end - fr_start) / 1000));
+
+        slot    = *it;
+        last_id = slot->id;
+
+        break;
+    }
+
+    if (slot == nullptr) {
+        log_w("Find newer results slot timeout...");
+        httpd_resp_send_500(req);
+        return ESP_OK;
+    }
+    
+    const char* img_head = strnstr((const char*)slot->data, MSG_IMAGE_KEY MSG_QUOTE_STR, slot->size);
+    if (img_head != NULL) {
+        size_t offset        = (img_head - (const char*)slot->data) + strlen(MSG_IMAGE_KEY MSG_QUOTE_STR);
+        const char* img_tail = strnstr((const char*)slot->data + offset, MSG_QUOTE_STR, slot->size - offset);
+        if (img_tail == NULL) {
+            log_e("Broken json format...");
+            httpd_resp_send_500(req);
+            return ESP_OK;
+        }
+        
+        offset += strlen(MSG_QUOTE_STR);
+        const char* img_tail_full = strnstr((const char*)slot->data + offset, MSG_COMMA_STR, slot->size - offset);
+        if (img_tail_full != NULL) {
+            img_tail = img_tail_full;
+        }
+       
+        memset(rst_buf, 0, RST_BUFFER_SIZE);
+        size_t copied = 0;
+        size_t size   = img_head - (const char*)slot->data;
+        if (size >= RST_BUFFER_SIZE) {
+            log_e("Results buffer is not enough...");
+            httpd_resp_send_500(req);
+            return ESP_OK;
+        }
+        strncpy(rst_buf, (const char*)slot->data, size);
+        copied += size;
+        size = ((const char*)slot->data + slot->size) - img_tail;
+        if (copied + size >= RST_BUFFER_SIZE) {
+            log_e("Results buffer is not enough...");
+            httpd_resp_send_500(req);
+            return ESP_OK;
+        }
+        strncpy(rst_buf + copied, img_tail, size);
+    }
+
+    res = httpd_resp_set_type(req, "application/json");
+    if (res != ESP_OK) {
         return res;
-#if CONFIG_ESP_FACE_DETECT_ENABLED
+    }
+    res = httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    if (res != ESP_OK) {
+        return res;
     }
 
-    jpg_chunking_t jchunk = {req, 0};
-
-    if (fb->format == PIXFORMAT_RGB565
-    #if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-        && !recognition_enabled
-    #endif
-    ) {
-    #if TWO_STAGE
-        HumanFaceDetectMSR01             s1(0.1F, 0.5F, 10, 0.2F);
-        HumanFaceDetectMNP01             s2(0.5F, 0.3F, 5);
-        std::list<dl::detect::result_t>& candidates =
-          s1.infer((uint16_t*)fb->buf, {(int)fb->height, (int)fb->width, 3});
-        std::list<dl::detect::result_t>& results =
-          s2.infer((uint16_t*)fb->buf, {(int)fb->height, (int)fb->width, 3}, candidates);
-    #else
-        HumanFaceDetectMSR01             s1(0.3F, 0.5F, 10, 0.2F);
-        std::list<dl::detect::result_t>& results = s1.infer((uint16_t*)fb->buf, {(int)fb->height, (int)fb->width, 3});
-    #endif
-        if (results.size() > 0) {
-            fb_data_t rfb;
-            rfb.width           = fb->width;
-            rfb.height          = fb->height;
-            rfb.data            = fb->buf;
-            rfb.bytes_per_pixel = 2;
-            rfb.format          = FB_RGB565;
-    #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-            detected = true;
-    #endif
-            draw_face_boxes(&rfb, &results, face_id);
-        }
-        s = fmt2jpg_cb(fb->buf, fb->len, fb->width, fb->height, PIXFORMAT_RGB565, 90, jpg_encode_stream, &jchunk);
-        esp_camera_fb_return(fb);
-    } else {
-        out_len    = fb->width * fb->height * 3;
-        out_width  = fb->width;
-        out_height = fb->height;
-        out_buf    = (uint8_t*)malloc(out_len);
-        if (!out_buf) {
-            log_e("out_buf malloc failed");
-            httpd_resp_send_500(req);
-            return ESP_FAIL;
-        }
-        s = fmt2rgb888(fb->buf, fb->len, fb->format, out_buf);
-        esp_camera_fb_return(fb);
-        if (!s) {
-            free(out_buf);
-            log_e("To rgb888 failed");
-            httpd_resp_send_500(req);
-            return ESP_FAIL;
-        }
-
-        fb_data_t rfb;
-        rfb.width           = out_width;
-        rfb.height          = out_height;
-        rfb.data            = out_buf;
-        rfb.bytes_per_pixel = 3;
-        rfb.format          = FB_BGR888;
-
-    #if TWO_STAGE
-        HumanFaceDetectMSR01             s1(0.1F, 0.5F, 10, 0.2F);
-        HumanFaceDetectMNP01             s2(0.5F, 0.3F, 5);
-        std::list<dl::detect::result_t>& candidates = s1.infer((uint8_t*)out_buf, {(int)out_height, (int)out_width, 3});
-        std::list<dl::detect::result_t>& results =
-          s2.infer((uint8_t*)out_buf, {(int)out_height, (int)out_width, 3}, candidates);
-    #else
-        HumanFaceDetectMSR01             s1(0.3F, 0.5F, 10, 0.2F);
-        std::list<dl::detect::result_t>& results = s1.infer((uint8_t*)out_buf, {(int)out_height, (int)out_width, 3});
-    #endif
-
-        if (results.size() > 0) {
-    #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-            detected = true;
-    #endif
-    #if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-            if (recognition_enabled) {
-                face_id = run_face_recognition(&rfb, &results);
-            }
-    #endif
-            draw_face_boxes(&rfb, &results, face_id);
-        }
-
-        s = fmt2jpg_cb(out_buf, out_len, out_width, out_height, PIXFORMAT_RGB888, 90, jpg_encode_stream, &jchunk);
-        free(out_buf);
+    char ts[32] = {0};
+    snprintf(ts, sizeof(ts), "%ld", slot->id);
+    res = httpd_resp_set_hdr(req, "X-Id", (const char*)ts);
+    if (res != ESP_OK) {
+        return res;
     }
 
-    if (!s) {
-        log_e("JPEG compression failed");
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
+    memset(ts, 0, sizeof(ts));
+    snprintf(ts, sizeof(ts), "%ld.%06ld", slot->timestamp.tv_sec, slot->timestamp.tv_usec);
+    res = httpd_resp_set_hdr(req, "X-Timestamp", (const char*)ts);
+    if (res != ESP_OK) {
+        return res;
     }
-    #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-    int64_t fr_end = esp_timer_get_time();
-    #endif
-    log_i("FACE: %uB %ums %s%d",
-          (uint32_t)(jchunk.len),
-          (uint32_t)((fr_end - fr_start) / 1000),
-          detected ? "DETECTED " : "",
-          face_id);
+
+    size_t  last_frame_id;
+    timeval last_frame_timestamp;
+
+    xSemaphoreTake(SI.mutex, portMAX_DELAY);
+    last_frame_id = SI.last_frame_id;
+    last_frame_timestamp = SI.last_frame_timestamp;
+    xSemaphoreGive(SI.mutex);
+
+    memset(ts, 0, sizeof(ts));
+    snprintf(ts, sizeof(ts), "%ld", last_frame_id);
+    res = httpd_resp_set_hdr(req, "X-Last-Frame-Id", (const char*)ts);
+    if (res != ESP_OK) {
+        return res;
+    }
+
+    memset(ts, 0, sizeof(ts));
+    snprintf(ts, sizeof(ts), "%ld.%06ld", last_frame_timestamp.tv_sec, last_frame_timestamp.tv_usec);
+    res = httpd_resp_set_hdr(req, "X-Last-Frame-Timestamp", (const char*)ts);
+    if (res != ESP_OK) {
+        return res;
+    }
+
+    res = httpd_resp_send(req, (const char*)rst_buf, strlen(rst_buf));
+    if (res != ESP_OK) {
+        log_e("Send results failed...");
+    }
+
     return res;
-#endif
 }
 
 static esp_err_t stream_handler(httpd_req_t* req) {
-    esp_err_t res      = ESP_OK;
-    char*     part_buf[128];
-    char*     jpeg_buf = NULL;
-    size_t    last_id  = -1;
+    esp_err_t     res      = ESP_OK;
+    char*         part_buf[128];
+    char*         jpeg_buf = NULL;
+    static size_t last_id  = -1;
 
     res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
     if (res != ESP_OK) {
@@ -701,20 +683,15 @@ static esp_err_t stream_handler(httpd_req_t* req) {
             last_id = slot->id;
         }
 
-        const char* slice = strnstr((const char*)slot->data, MSG_IMAGE_KEY MSG_COMMA_STR, slot->size);
+        const char* slice = strnstr((const char*)slot->data, MSG_IMAGE_KEY MSG_QUOTE_STR, slot->size);
         if (slice == NULL) {
             log_w("No image data found...");
             vTaskDelay(10 / portTICK_PERIOD_MS);
             continue;
         }
-        size_t offset = (slice - (const char*)slot->data) + strlen(MSG_IMAGE_KEY MSG_COMMA_STR);
-        if (offset >= slot->size) {
-            log_w("Invalid image data...");
-            vTaskDelay(10 / portTICK_PERIOD_MS);
-            continue;
-        }
-        const char* data  = (const char*)slot->data + offset;
-        const char* quote = strnstr(data, MSG_COMMA_STR, slot->size - offset);
+        size_t      offset = (slice - (const char*)slot->data) + strlen(MSG_IMAGE_KEY MSG_QUOTE_STR);
+        const char* data   = (const char*)slot->data + offset;
+        const char* quote  = strnstr(data, MSG_QUOTE_STR, slot->size - offset);
         if (quote == NULL) {
             log_w("Invalid image data size...");
             vTaskDelay(10 / portTICK_PERIOD_MS);
@@ -735,25 +712,35 @@ static esp_err_t stream_handler(httpd_req_t* req) {
             continue;
         }
 
-        if (res == ESP_OK) {
-            res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+        xSemaphoreTake(SI.mutex, portMAX_DELAY);
+        SI.last_frame_id        = slot->id;
+        SI.last_frame_timestamp = slot->timestamp;
+        xSemaphoreGive(SI.mutex);
+        
+        res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+        if (res != ESP_OK) {
+            goto SendError;
         }
 
-        if (res == ESP_OK) {
+        {
             memset(part_buf, 0, sizeof(part_buf));
             size_t hlen = snprintf((char*)part_buf, sizeof(part_buf), _STREAM_PART, jpeg_size, slot->timestamp.tv_sec, slot->timestamp.tv_usec);
             res         = httpd_resp_send_chunk(req, (const char*)part_buf, hlen);
         }
-
-        if (res == ESP_OK) {
-            res = httpd_resp_send_chunk(req, jpeg_buf, jpeg_size);
-        }
-
         if (res != ESP_OK) {
-            log_e("Send frame failed");
-            break;
+            goto SendError;
         }
 
+        res = httpd_resp_send_chunk(req, jpeg_buf, jpeg_size);
+        if (res != ESP_OK) {
+            goto SendError;
+        }
+
+        continue;
+
+    SendError:
+        log_e("Send frame failed...");
+        break;
     }
 
     free(jpeg_buf);
@@ -1218,17 +1205,17 @@ void startCameraServer() {
     // #endif
     //     };
 
-    //     httpd_uri_t capture_uri = {.uri      = "/capture",
-    //                                .method   = HTTP_GET,
-    //                                .handler  = capture_handler,
-    //                                .user_ctx = NULL
-    // #ifdef CONFIG_HTTPD_WS_SUPPORT
-    //                                ,
-    //                                .is_websocket             = true,
-    //                                .handle_ws_control_frames = false,
-    //                                .supported_subprotocol    = NULL
-    // #endif
-    //     };
+    httpd_uri_t capture_uri = {.uri      = "/results",
+                                .method   = HTTP_GET,
+                                .handler  = results_handler,
+                                .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+                                ,
+                                .is_websocket             = true,
+                                .handle_ws_control_frames = false,
+                                .supported_subprotocol    = NULL
+#endif
+    };
 
     httpd_uri_t stream_uri = {.uri      = "/stream",
                               .method   = HTTP_GET,
@@ -1337,20 +1324,11 @@ void startCameraServer() {
         // httpd_register_uri_handler(camera_httpd, &win_uri);
     }
 
-    config.server_port += 1;
-    config.ctrl_port += 1;
+    config.server_port = 554;
+    config.ctrl_port = 554;
 
     log_i("Starting stream server on port: '%d'", config.server_port);
     if (httpd_start(&stream_httpd, &config) == ESP_OK) {
         httpd_register_uri_handler(stream_httpd, &stream_uri);
     }
-}
-
-void setupLedFlash(int pin) {
-#if CONFIG_LED_ILLUMINATOR_ENABLED
-    ledcSetup(LED_LEDC_CHANNEL, 5000, 8);
-    ledcAttachPin(pin, LED_LEDC_CHANNEL);
-#else
-    log_i("LED flash is disabled -> CONFIG_LED_ILLUMINATOR_ENABLED = 0");
-#endif
 }
