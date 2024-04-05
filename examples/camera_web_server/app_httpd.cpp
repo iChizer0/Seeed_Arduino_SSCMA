@@ -38,10 +38,16 @@
 #endif
 
 #define RESULT_TIMEOUT_MS 3000
+#define CMD_TIMEOUT_MS 3000
 
 #define PTR_BUFFER_SIZE 8
 #define JPG_BUFFER_SIZE (1024 * 128)
 #define RST_BUFFER_SIZE (1024 * 128)
+#define QRY_BUFFER_SIZE (1024 * 16)
+#define CMD_BUFFER_SIZE (1024 * 12)
+
+#define CMD_TAG_FMT_STR "HTTPD%.8x@"
+#define CMD_TAG_SIZE    snprintf(NULL, 0, CMD_TAG_FMT_STR, 0)
 
 #define MSG_IMAGE_KEY   "\"image\": "
 #define MSG_COMMA_STR   ", "
@@ -79,6 +85,7 @@ struct PtrBuffer {
 
     SemaphoreHandle_t                 mutex;
     std::deque<std::shared_ptr<Slot>> slots;
+    volatile size_t                   id    = 0;
     const size_t                      limit = PTR_BUFFER_SIZE;
 };
 
@@ -136,9 +143,7 @@ inline uint16_t getCmdType(const char* resp, size_t len) {
 }
 
 static void proxyCallback(const char* resp, size_t len) {
-    static size_t id = 0;
     static timeval timestamp;
-
     TickType_t ticks  = xTaskGetTickCount();
     timestamp.tv_sec  = ticks / configTICK_RATE_HZ;
     timestamp.tv_usec = (ticks % configTICK_RATE_HZ) * 1e6 / configTICK_RATE_HZ;
@@ -169,7 +174,7 @@ static void proxyCallback(const char* resp, size_t len) {
         return;
     }
 
-    p_slot->id        = id++;
+    p_slot->id        = PB.id;
     p_slot->type      = type;
     p_slot->data      = copy;
     p_slot->size      = len;
@@ -192,6 +197,7 @@ static void proxyCallback(const char* resp, size_t len) {
         free(p);
     }));
     xSemaphoreGive(PB.mutex);
+    PB.id = p_slot->id + 1;
 
     if (discarded > 0) {
         log_w("Discarded %u old responses...", discarded);
@@ -534,10 +540,12 @@ static esp_err_t results_handler(httpd_req_t* req) {
         auto slots = PB.slots;
         xSemaphoreGive(PB.mutex);
 
-        auto it = std::find_if(slots.rbegin(), slots.rend(), [](std::shared_ptr<PtrBuffer::Slot> p) {
-            return p->type == (MSG_TYPE_EVENT | CMD_TYPE_SAMPLE) || p->type == (MSG_TYPE_EVENT | CMD_TYPE_INVOKE);
+        auto it = std::find_if(slots.rbegin(), slots.rend(), [&](std::shared_ptr<PtrBuffer::Slot> p) {
+            return (p->type == (MSG_TYPE_EVENT | CMD_TYPE_SAMPLE) || 
+                    p->type == (MSG_TYPE_EVENT | CMD_TYPE_INVOKE)) &&
+                    p->id - last_id > 0;
         });
-        if (it == slots.rend() || it->get()->id == last_id) {
+        if (it == slots.rend()) {
             vTaskDelay(10 / portTICK_PERIOD_MS);
             continue;
         }
@@ -653,10 +661,12 @@ static esp_err_t stream_handler(httpd_req_t* req) {
             auto slots = PB.slots;
             xSemaphoreGive(PB.mutex);
 
-            auto it = std::find_if(slots.rbegin(), slots.rend(), [](std::shared_ptr<PtrBuffer::Slot> p) {
-                return p->type == (MSG_TYPE_EVENT | CMD_TYPE_SAMPLE) || p->type == (MSG_TYPE_EVENT | CMD_TYPE_INVOKE);
+            auto it = std::find_if(slots.rbegin(), slots.rend(), [&](std::shared_ptr<PtrBuffer::Slot> p) {
+                return (p->type == (MSG_TYPE_EVENT | CMD_TYPE_SAMPLE) || 
+                        p->type == (MSG_TYPE_EVENT | CMD_TYPE_INVOKE)) &&
+                        p->id - last_id > 0;
             });
-            if (it == slots.rend() || it->get()->id == last_id) {
+            if (it == slots.rend()) {
                 vTaskDelay(10 / portTICK_PERIOD_MS);
                 continue;
             }
@@ -752,116 +762,110 @@ static esp_err_t parse_get(httpd_req_t* req, char** obuf) {
     return ESP_FAIL;
 }
 
-static esp_err_t cmd_handler(httpd_req_t* req) {
+static esp_err_t cmd_proxy_handler(httpd_req_t* req) {
     char* buf = NULL;
-    char  variable[32];
-    char  value[32];
 
     if (parse_get(req, &buf) != ESP_OK) {
         return ESP_FAIL;
     }
-    if (httpd_query_key_value(buf, "var", variable, sizeof(variable)) != ESP_OK ||
-        httpd_query_key_value(buf, "val", value, sizeof(value)) != ESP_OK) {
+
+    char* qry_buf = (char*)malloc(QRY_BUFFER_SIZE);
+    if (qry_buf == NULL) {
         free(buf);
+        log_e("Failed to allocate query buffer...");
+        httpd_resp_send_500(req);
+        return ESP_ERR_NO_MEM;
+    }
+
+    memset(qry_buf, 0, QRY_BUFFER_SIZE);
+    if (httpd_query_key_value(buf, "baes64", qry_buf, QRY_BUFFER_SIZE - 1) != ESP_OK) {
+        free(buf);
+        free(qry_buf);
         httpd_resp_send_404(req);
         return ESP_FAIL;
     }
     free(buf);
+    
+    char* cmd_buf = (char*)malloc(CMD_BUFFER_SIZE);
+    if (cmd_buf == NULL) {
+        free(qry_buf);
+        log_e("Failed to allocate cmd buffer...");
+        httpd_resp_send_500(req);
+        return ESP_ERR_NO_MEM;
+    }
+    size_t cmd_size = 0;
+    memset(cmd_buf, 0, CMD_BUFFER_SIZE);
+    if (mbedtls_base64_decode((unsigned char*)cmd_buf, CMD_BUFFER_SIZE, &cmd_size, (const unsigned char*)qry_buf, strlen(qry_buf)) != 0) {
+        free(qry_buf);
+        free(cmd_buf);
+        log_e("Failed to decode cmd data...");
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    free(qry_buf);
 
-    int val = atoi(value);
-    log_i("%s = %d", variable, val);
-    sensor_t* s   = esp_camera_sensor_get();
-    int       res = 0;
+    TickType_t ticks  = xTaskGetTickCount();
+    char cmd_tag_buf[32] = {0};
+    size_t cmd_tag_size = snprintf(cmd_tag_buf, sizeof(cmd_tag_buf), CMD_TAG_FMT_STR, ticks);
 
-    if (!strcmp(variable, "framesize")) {
-        if (s->pixformat == PIXFORMAT_JPEG) {
-            res = s->set_framesize(s, (framesize_t)val);
+    size_t last_id = PB.id;
+
+    AI.write(CMD_PREFIX, strlen(CMD_PREFIX));
+    AI.write(cmd_tag_buf, cmd_tag_size);
+    AI.write(cmd_buf, cmd_size);
+    free(cmd_buf);
+    AI.write(CMD_SUFFIX, strlen(CMD_SUFFIX));
+
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+
+    std::shared_ptr<PtrBuffer::Slot> slot = nullptr;
+
+    TickType_t time_begin = xTaskGetTickCount();
+    while ((xTaskGetTickCount() - time_begin) < RESULT_TIMEOUT_MS) {
+        xSemaphoreTake(PB.mutex, portMAX_DELAY);
+        auto slots = PB.slots;
+        xSemaphoreGive(PB.mutex);
+
+        auto it_newer = std::find_if(slots.begin(), slots.end(), [&](std::shared_ptr<PtrBuffer::Slot> p) {
+            if (p->id <= last_id) {
+                return false;
+            }
+            last_id = p->id;
+            return true;
+        });
+        auto it = std::find_if(it_newer, slots.end(), [&](std::shared_ptr<PtrBuffer::Slot> p) {
+            if (p->type & MSG_TYPE_REPLY || p->type & MSG_TYPE_LOGGI) {
+                const char* tag = strnstr((const char*)p->data, cmd_tag_buf, p->size);
+                if (tag == NULL) {
+                    goto NotFound;
+                }
+                return true;
+            }
+        NotFound:
+            last_id = p->id;
+            return false;
+        });
+        if (it == slots.end()) {
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+            continue;
         }
-    } else if (!strcmp(variable, "quality"))
-        res = s->set_quality(s, val);
-    else if (!strcmp(variable, "contrast"))
-        res = s->set_contrast(s, val);
-    else if (!strcmp(variable, "brightness"))
-        res = s->set_brightness(s, val);
-    else if (!strcmp(variable, "saturation"))
-        res = s->set_saturation(s, val);
-    else if (!strcmp(variable, "gainceiling"))
-        res = s->set_gainceiling(s, (gainceiling_t)val);
-    else if (!strcmp(variable, "colorbar"))
-        res = s->set_colorbar(s, val);
-    else if (!strcmp(variable, "awb"))
-        res = s->set_whitebal(s, val);
-    else if (!strcmp(variable, "agc"))
-        res = s->set_gain_ctrl(s, val);
-    else if (!strcmp(variable, "aec"))
-        res = s->set_exposure_ctrl(s, val);
-    else if (!strcmp(variable, "hmirror"))
-        res = s->set_hmirror(s, val);
-    else if (!strcmp(variable, "vflip"))
-        res = s->set_vflip(s, val);
-    else if (!strcmp(variable, "awb_gain"))
-        res = s->set_awb_gain(s, val);
-    else if (!strcmp(variable, "agc_gain"))
-        res = s->set_agc_gain(s, val);
-    else if (!strcmp(variable, "aec_value"))
-        res = s->set_aec_value(s, val);
-    else if (!strcmp(variable, "aec2"))
-        res = s->set_aec2(s, val);
-    else if (!strcmp(variable, "dcw"))
-        res = s->set_dcw(s, val);
-    else if (!strcmp(variable, "bpc"))
-        res = s->set_bpc(s, val);
-    else if (!strcmp(variable, "wpc"))
-        res = s->set_wpc(s, val);
-    else if (!strcmp(variable, "raw_gma"))
-        res = s->set_raw_gma(s, val);
-    else if (!strcmp(variable, "lenc"))
-        res = s->set_lenc(s, val);
-    else if (!strcmp(variable, "special_effect"))
-        res = s->set_special_effect(s, val);
-    else if (!strcmp(variable, "wb_mode"))
-        res = s->set_wb_mode(s, val);
-    else if (!strcmp(variable, "ae_level"))
-        res = s->set_ae_level(s, val);
-#if CONFIG_LED_ILLUMINATOR_ENABLED
-    else if (!strcmp(variable, "led_intensity")) {
-        led_duty = val;
-        if (isStreaming) enable_led(true);
-    }
-#endif
 
-#if CONFIG_ESP_FACE_DETECT_ENABLED
-    else if (!strcmp(variable, "face_detect")) {
-        detection_enabled = val;
-    #if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-        if (!detection_enabled) {
-            recognition_enabled = 0;
-        }
-    #endif
-    }
-    #if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-    else if (!strcmp(variable, "face_enroll")) {
-        is_enrolling = !is_enrolling;
-        log_i("Enrolling: %s", is_enrolling ? "true" : "false");
-    } else if (!strcmp(variable, "face_recognize")) {
-        recognition_enabled = val;
-        if (recognition_enabled) {
-            detection_enabled = val;
-        }
-    }
-    #endif
-#endif
-    else {
-        log_i("Unknown command: %s", variable);
-        res = -1;
+        slot = *it;
+    
+        break;
     }
 
-    if (res < 0) {
-        return httpd_resp_send_500(req);
+    if (slot == nullptr) {
+        log_w("Wait client reply slot timeout...");
+        httpd_resp_send_500(req);
+        return ESP_OK;
     }
 
+    httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    return httpd_resp_send(req, NULL, 0);
+    httpd_resp_set_hdr(req, "X-Cmd-Tag", cmd_tag_buf);
+
+    return httpd_resp_send(req, (const char*)slot->data, slot->size);
 }
 
 static int print_reg(char* p, sensor_t* s, uint16_t reg, uint32_t mask) {
@@ -1176,17 +1180,17 @@ void startCameraServer() {
     // #endif
     //     };
 
-    //     httpd_uri_t cmd_uri = {.uri      = "/control",
-    //                            .method   = HTTP_GET,
-    //                            .handler  = cmd_handler,
-    //                            .user_ctx = NULL
-    // #ifdef CONFIG_HTTPD_WS_SUPPORT
-    //                            ,
-    //                            .is_websocket             = true,
-    //                            .handle_ws_control_frames = false,
-    //                            .supported_subprotocol    = NULL
-    // #endif
-    //     };
+    httpd_uri_t cmd_uri = {.uri      = "/cmd_proxy",
+                            .method   = HTTP_GET,
+                            .handler  = cmd_proxy_handler,
+                            .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+                            ,
+                            .is_websocket             = true,
+                            .handle_ws_control_frames = false,
+                            .supported_subprotocol    = NULL
+#endif
+    };
 
     httpd_uri_t capture_uri = {.uri      = "/results",
                                 .method   = HTTP_GET,

@@ -165,5 +165,5 @@ void setup() {
 void loop() {
     // Do nothing. Everything is done in another task by the web server
     loopRemoteProxy();
-    delay(10);
+    delay(5);
 }
