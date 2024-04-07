@@ -38,23 +38,23 @@
 #endif
 
 #define RESULT_TIMEOUT_MS 3000
-#define CMD_TIMEOUT_MS 3000
+#define CMD_TIMEOUT_MS    3000
 
-#define PTR_BUFFER_SIZE 8
-#define JPG_BUFFER_SIZE (1024 * 128)
-#define RST_BUFFER_SIZE (1024 * 128)
-#define QRY_BUFFER_SIZE (1024 * 16)
-#define CMD_BUFFER_SIZE (1024 * 12)
+#define PTR_BUFFER_SIZE   8
+#define JPG_BUFFER_SIZE   (1024 * 128)
+#define RST_BUFFER_SIZE   (1024 * 128)
+#define QRY_BUFFER_SIZE   (1024 * 16)
+#define CMD_BUFFER_SIZE   (1024 * 12)
 
-#define CMD_TAG_FMT_STR "HTTPD%.8x@"
-#define CMD_TAG_SIZE    snprintf(NULL, 0, CMD_TAG_FMT_STR, 0)
+#define CMD_TAG_FMT_STR   "HTTPD%.8x@"
+#define CMD_TAG_SIZE      snprintf(NULL, 0, CMD_TAG_FMT_STR, 0)
 
-#define MSG_IMAGE_KEY   "\"image\": "
-#define MSG_COMMA_STR   ", "
-#define MSG_QUOTE_STR   "\""
-#define MSG_REPLY_STR   "\"type\": 0"
-#define MSG_EVENT_STR   "\"type\": 1"
-#define MSG_LOGGI_STR   "\"type\": 2"
+#define MSG_IMAGE_KEY     "\"image\": "
+#define MSG_COMMA_STR     ", "
+#define MSG_QUOTE_STR     "\""
+#define MSG_REPLY_STR     "\"type\": 0"
+#define MSG_EVENT_STR     "\"type\": 1"
+#define MSG_LOGGI_STR     "\"type\": 2"
 
 enum MsgType : uint16_t {
     MSG_TYPE_UNKNOWN = 0,
@@ -85,7 +85,7 @@ struct PtrBuffer {
 
     SemaphoreHandle_t                 mutex;
     std::deque<std::shared_ptr<Slot>> slots;
-    volatile size_t                   id    = 0;
+    volatile size_t                   id    = 1;
     const size_t                      limit = PTR_BUFFER_SIZE;
 };
 
@@ -99,9 +99,7 @@ PtrBuffer PB;
 StatInfo  SI;
 SSCMA     AI;
 
-void initSharedBuffer() { 
-    PB.mutex = xSemaphoreCreateMutex();
-}
+void initSharedBuffer() { PB.mutex = xSemaphoreCreateMutex(); }
 
 void initStatInfo() {
     SI.mutex                        = xSemaphoreCreateMutex();
@@ -144,9 +142,9 @@ inline uint16_t getCmdType(const char* resp, size_t len) {
 
 static void proxyCallback(const char* resp, size_t len) {
     static timeval timestamp;
-    TickType_t ticks  = xTaskGetTickCount();
-    timestamp.tv_sec  = ticks / configTICK_RATE_HZ;
-    timestamp.tv_usec = (ticks % configTICK_RATE_HZ) * 1e6 / configTICK_RATE_HZ;
+    TickType_t     ticks = xTaskGetTickCount();
+    timestamp.tv_sec     = ticks / configTICK_RATE_HZ;
+    timestamp.tv_usec    = (ticks % configTICK_RATE_HZ) * 1e6 / configTICK_RATE_HZ;
 
     if (!len) {
         log_i("Response is empty...");
@@ -197,10 +195,10 @@ static void proxyCallback(const char* resp, size_t len) {
         free(p);
     }));
     xSemaphoreGive(PB.mutex);
-    PB.id = p_slot->id + 1;
+    PB.id += 1;
 
     if (discarded > 0) {
-        log_w("Discarded %u old responses...", discarded);
+        log_i("Discarded %u old responses...", discarded);
     }
 
     log_i("Received %u bytes...", len);
@@ -518,9 +516,9 @@ static size_t jpg_encode_stream(void* arg, size_t index, const void* data, size_
     return len;
 }
 
-static esp_err_t results_handler(httpd_req_t* req) { 
-    esp_err_t     res      = ESP_OK;
-    static size_t last_id  = -1;
+static esp_err_t results_handler(httpd_req_t* req) {
+    esp_err_t     res     = ESP_OK;
+    static size_t last_id = 0;
     static char*  hdr_buf[128];
     static char*  rst_buf = NULL;
     if (rst_buf == NULL) {
@@ -540,18 +538,22 @@ static esp_err_t results_handler(httpd_req_t* req) {
         auto slots = PB.slots;
         xSemaphoreGive(PB.mutex);
 
-        auto it = std::find_if(slots.rbegin(), slots.rend(), [&](std::shared_ptr<PtrBuffer::Slot> p) {
-            return (p->type == (MSG_TYPE_EVENT | CMD_TYPE_SAMPLE) || 
-                    p->type == (MSG_TYPE_EVENT | CMD_TYPE_INVOKE)) &&
-                    p->id - last_id > 0;
-        });
-        if (it == slots.rend()) {
+        for (auto it = slots.rbegin(); it != slots.rend(); ++it) {
+            if (it->get()->id <= last_id) {
+                break;
+            }
+            if (it->get()->type == (MSG_TYPE_EVENT | CMD_TYPE_SAMPLE) ||
+                it->get()->type == (MSG_TYPE_EVENT | CMD_TYPE_INVOKE)) {
+                slot    = *it;
+                last_id = slot->id;
+                break;
+            }
+        }
+
+        if (!slot) {
             vTaskDelay(10 / portTICK_PERIOD_MS);
             continue;
         }
-
-        slot    = *it;
-        last_id = slot->id;
 
         break;
     }
@@ -561,39 +563,46 @@ static esp_err_t results_handler(httpd_req_t* req) {
         httpd_resp_send_500(req);
         return ESP_OK;
     }
-    
+
     const char* img_head = strnstr((const char*)slot->data, MSG_IMAGE_KEY MSG_QUOTE_STR, slot->size);
     if (img_head != NULL) {
-        size_t offset        = (img_head - (const char*)slot->data) + strlen(MSG_IMAGE_KEY MSG_QUOTE_STR);
+        size_t offset = (img_head - (const char*)slot->data) + strlen(MSG_IMAGE_KEY MSG_QUOTE_STR);
+
+        bool        found_prefix_comma = false;
+        const char* img_head_full      = img_head - strlen(MSG_COMMA_STR);
+        if (img_head_full >= (const char*)slot->data) {
+            if (strncmp(img_head_full, MSG_COMMA_STR, strlen(MSG_COMMA_STR)) == 0) {
+                img_head           = img_head_full;
+                found_prefix_comma = true;
+            }
+        }
+
         const char* img_tail = strnstr((const char*)slot->data + offset, MSG_QUOTE_STR, slot->size - offset);
         if (img_tail == NULL) {
             log_e("Broken json format...");
             httpd_resp_send_500(req);
             return ESP_OK;
         }
-        
-        offset += strlen(MSG_QUOTE_STR);
-        const char* img_tail_full = strnstr((const char*)slot->data + offset, MSG_COMMA_STR, slot->size - offset);
-        if (img_tail_full != NULL) {
-            img_tail = img_tail_full;
+        offset = (img_tail - (const char*)slot->data) + strlen(MSG_QUOTE_STR);
+
+        if (!found_prefix_comma) {
+            const char* img_tail_full = strnstr((const char*)slot->data + offset, MSG_COMMA_STR, slot->size - offset);
+            if (img_tail_full != NULL) {
+                img_tail = img_tail_full;
+            }
         }
-       
-        memset(rst_buf, 0, RST_BUFFER_SIZE);
-        size_t copied = 0;
-        size_t size   = img_head - (const char*)slot->data;
-        if (size >= RST_BUFFER_SIZE) {
+
+        if (slot->size - (img_tail - img_head) >= RST_BUFFER_SIZE) {
             log_e("Results buffer is not enough...");
             httpd_resp_send_500(req);
             return ESP_OK;
         }
+        memset(rst_buf, 0, RST_BUFFER_SIZE);
+        size_t size   = img_head - (const char*)slot->data;
+        size_t copied = 0;
         strncpy(rst_buf, (const char*)slot->data, size);
         copied += size;
         size = ((const char*)slot->data + slot->size) - img_tail;
-        if (copied + size >= RST_BUFFER_SIZE) {
-            log_e("Results buffer is not enough...");
-            httpd_resp_send_500(req);
-            return ESP_OK;
-        }
         strncpy(rst_buf + copied, img_tail, size);
     }
 
@@ -612,7 +621,7 @@ static esp_err_t results_handler(httpd_req_t* req) {
     timeval last_frame_timestamp;
 
     xSemaphoreTake(SI.mutex, portMAX_DELAY);
-    last_frame_id = SI.last_frame_id;
+    last_frame_id        = SI.last_frame_id;
     last_frame_timestamp = SI.last_frame_timestamp;
     xSemaphoreGive(SI.mutex);
 
@@ -633,10 +642,10 @@ static esp_err_t results_handler(httpd_req_t* req) {
 }
 
 static esp_err_t stream_handler(httpd_req_t* req) {
-    esp_err_t     res      = ESP_OK;
-    char*         part_buf[128];
-    char*         jpeg_buf = NULL;
-    static size_t last_id  = -1;
+    esp_err_t res = ESP_OK;
+    char*     part_buf[128];
+    char*     jpeg_buf = NULL;
+    size_t    last_id  = 0;
 
     res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
     if (res != ESP_OK) {
@@ -653,26 +662,29 @@ static esp_err_t stream_handler(httpd_req_t* req) {
     }
 
     while (true) {
-
-        std::shared_ptr<PtrBuffer::Slot> slot;
+        std::shared_ptr<PtrBuffer::Slot> slot = nullptr;
 
         {
             xSemaphoreTake(PB.mutex, portMAX_DELAY);
             auto slots = PB.slots;
             xSemaphoreGive(PB.mutex);
 
-            auto it = std::find_if(slots.rbegin(), slots.rend(), [&](std::shared_ptr<PtrBuffer::Slot> p) {
-                return (p->type == (MSG_TYPE_EVENT | CMD_TYPE_SAMPLE) || 
-                        p->type == (MSG_TYPE_EVENT | CMD_TYPE_INVOKE)) &&
-                        p->id - last_id > 0;
-            });
-            if (it == slots.rend()) {
+            for (auto it = slots.rbegin(); it != slots.rend(); ++it) {
+                if (it->get()->id <= last_id) {
+                    break;
+                }
+                if (it->get()->type == (MSG_TYPE_EVENT | CMD_TYPE_SAMPLE) ||
+                    it->get()->type == (MSG_TYPE_EVENT | CMD_TYPE_INVOKE)) {
+                    slot    = *it;
+                    last_id = slot->id;
+                    break;
+                }
+            }
+
+            if (!slot) {
                 vTaskDelay(10 / portTICK_PERIOD_MS);
                 continue;
             }
-
-            slot    = *it;
-            last_id = slot->id;
         }
 
         const char* slice = strnstr((const char*)slot->data, MSG_IMAGE_KEY MSG_QUOTE_STR, slot->size);
@@ -698,7 +710,8 @@ static esp_err_t stream_handler(httpd_req_t* req) {
 
         size_t jpeg_size = 0;
         memset(jpeg_buf, 0, JPG_BUFFER_SIZE);
-        if (mbedtls_base64_decode((unsigned char*)jpeg_buf, JPG_BUFFER_SIZE, &jpeg_size, (const unsigned char*)data, len) != 0) {
+        if (mbedtls_base64_decode(
+              (unsigned char*)jpeg_buf, JPG_BUFFER_SIZE, &jpeg_size, (const unsigned char*)data, len) != 0) {
             log_e("Failed to decode image data...");
             vTaskDelay(10 / portTICK_PERIOD_MS);
             continue;
@@ -708,7 +721,7 @@ static esp_err_t stream_handler(httpd_req_t* req) {
         SI.last_frame_id        = slot->id;
         SI.last_frame_timestamp = slot->timestamp;
         xSemaphoreGive(SI.mutex);
-        
+
         res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
         if (res != ESP_OK) {
             goto SendError;
@@ -716,7 +729,12 @@ static esp_err_t stream_handler(httpd_req_t* req) {
 
         {
             memset(part_buf, 0, sizeof(part_buf));
-            size_t hlen = snprintf((char*)part_buf, sizeof(part_buf), _STREAM_PART, jpeg_size, slot->timestamp.tv_sec, slot->timestamp.tv_usec);
+            size_t hlen = snprintf((char*)part_buf,
+                                   sizeof(part_buf),
+                                   _STREAM_PART,
+                                   jpeg_size,
+                                   slot->timestamp.tv_sec,
+                                   slot->timestamp.tv_usec);
             res         = httpd_resp_send_chunk(req, (const char*)part_buf, hlen);
         }
         if (res != ESP_OK) {
@@ -733,7 +751,6 @@ static esp_err_t stream_handler(httpd_req_t* req) {
     SendError:
         log_e("Send frame failed...");
         break;
-
     }
 
     free(jpeg_buf);
@@ -785,7 +802,7 @@ static esp_err_t cmd_proxy_handler(httpd_req_t* req) {
         return ESP_FAIL;
     }
     free(buf);
-    
+
     char* cmd_buf = (char*)malloc(CMD_BUFFER_SIZE);
     if (cmd_buf == NULL) {
         free(qry_buf);
@@ -795,7 +812,8 @@ static esp_err_t cmd_proxy_handler(httpd_req_t* req) {
     }
     size_t cmd_size = 0;
     memset(cmd_buf, 0, CMD_BUFFER_SIZE);
-    if (mbedtls_base64_decode((unsigned char*)cmd_buf, CMD_BUFFER_SIZE, &cmd_size, (const unsigned char*)qry_buf, strlen(qry_buf)) != 0) {
+    if (mbedtls_base64_decode(
+          (unsigned char*)cmd_buf, CMD_BUFFER_SIZE, &cmd_size, (const unsigned char*)qry_buf, strlen(qry_buf)) != 0) {
         free(qry_buf);
         free(cmd_buf);
         log_e("Failed to decode cmd data...");
@@ -804,9 +822,9 @@ static esp_err_t cmd_proxy_handler(httpd_req_t* req) {
     }
     free(qry_buf);
 
-    TickType_t ticks  = xTaskGetTickCount();
-    char cmd_tag_buf[32] = {0};
-    size_t cmd_tag_size = snprintf(cmd_tag_buf, sizeof(cmd_tag_buf), CMD_TAG_FMT_STR, ticks);
+    TickType_t ticks           = xTaskGetTickCount();
+    char       cmd_tag_buf[32] = {0};
+    size_t     cmd_tag_size    = snprintf(cmd_tag_buf, sizeof(cmd_tag_buf), CMD_TAG_FMT_STR, ticks);
 
     size_t last_id = PB.id;
 
@@ -833,7 +851,7 @@ static esp_err_t cmd_proxy_handler(httpd_req_t* req) {
             last_id = p->id;
             return true;
         });
-        auto it = std::find_if(it_newer, slots.end(), [&](std::shared_ptr<PtrBuffer::Slot> p) {
+        auto it       = std::find_if(it_newer, slots.end(), [&](std::shared_ptr<PtrBuffer::Slot> p) {
             if (p->type & MSG_TYPE_REPLY || p->type & MSG_TYPE_LOGGI) {
                 const char* tag = strnstr((const char*)p->data, cmd_tag_buf, p->size);
                 if (tag == NULL) {
@@ -851,7 +869,7 @@ static esp_err_t cmd_proxy_handler(httpd_req_t* req) {
         }
 
         slot = *it;
-    
+
         break;
     }
 
@@ -1181,26 +1199,26 @@ void startCameraServer() {
     //     };
 
     httpd_uri_t cmd_uri = {.uri      = "/cmd_proxy",
-                            .method   = HTTP_GET,
-                            .handler  = cmd_proxy_handler,
-                            .user_ctx = NULL
+                           .method   = HTTP_GET,
+                           .handler  = cmd_proxy_handler,
+                           .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-                            ,
-                            .is_websocket             = true,
-                            .handle_ws_control_frames = false,
-                            .supported_subprotocol    = NULL
+                           ,
+                           .is_websocket             = true,
+                           .handle_ws_control_frames = false,
+                           .supported_subprotocol    = NULL
 #endif
     };
 
-    httpd_uri_t capture_uri = {.uri      = "/results",
-                                .method   = HTTP_GET,
-                                .handler  = results_handler,
-                                .user_ctx = NULL
+    httpd_uri_t results_uri = {.uri      = "/results",
+                               .method   = HTTP_GET,
+                               .handler  = results_handler,
+                               .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-                                ,
-                                .is_websocket             = true,
-                                .handle_ws_control_frames = false,
-                                .supported_subprotocol    = NULL
+                               ,
+                               .is_websocket             = true,
+                               .handle_ws_control_frames = false,
+                               .supported_subprotocol    = NULL
 #endif
     };
 
@@ -1301,7 +1319,7 @@ void startCameraServer() {
         // httpd_register_uri_handler(camera_httpd, &index_uri);
         // httpd_register_uri_handler(camera_httpd, &cmd_uri);
         // httpd_register_uri_handler(camera_httpd, &status_uri);
-        // httpd_register_uri_handler(camera_httpd, &capture_uri);
+        httpd_register_uri_handler(camera_httpd, &results_uri);
         // httpd_register_uri_handler(camera_httpd, &bmp_uri);
 
         // httpd_register_uri_handler(camera_httpd, &xclk_uri);
@@ -1311,8 +1329,8 @@ void startCameraServer() {
         // httpd_register_uri_handler(camera_httpd, &win_uri);
     }
 
-    config.server_port = 554;
-    config.ctrl_port = 554;
+    config.server_port = 8080;
+    config.ctrl_port   = 8080;
 
     log_i("Starting stream server on port: '%d'", config.server_port);
     if (httpd_start(&stream_httpd, &config) == ESP_OK) {
