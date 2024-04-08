@@ -6,42 +6,28 @@
  */
 #include "ep2_isp_i2c.h"
 
-#include "common.h"
-// #include "hmx_lib.h"
-
 #include <Wire.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define SDA_PIN 21
-#define SCL_PIN 22
+#include "common.h"
 
-void wireInit() {
-    // Wire.begin(SDA_PIN, SCL_PIN);
+#define PROGRESS_MAX (64)
 
-    Wire.setTimeOut(100);
-    Wire.setClock(400000);
-    Wire.setBufferSize(16 * 1024);
-
-    Wire.begin();
-}
-
-size_t scanWire() {
+bool probeDevice() {
     uint8_t error, address;
-    int     nDevices;
 
-    printf("Scanning...\n");
-
-    nDevices = 0;
     for (address = 1; address < 127; address++) {
         Wire.beginTransmission(address);
         error = Wire.endTransmission();
 
         if (error == 0) {
-            printf("I2C device found at address 0x%.2x\n", address);
-            nDevices++;
+            static_assert(CTRL_SLVID == DATA_SLVID);
+            if (address == CTRL_SLVID) {
+                return true;
+            }
         } else if (error == 4) {
             printf("Unknow error at address 0x%.2x\n", address);
         }
@@ -51,10 +37,21 @@ size_t scanWire() {
         Wire.read();
     }
 
-    return nDevices;
+    return false;
 }
 
-void printProgress(double percentage) { printf("\rProgress: %.2f%%\n", percentage * 100); }
+void printProgress(double percentage) {
+    printf("\rProgress: [");
+    int pos = PROGRESS_MAX * percentage;
+    for (int i = 0; i < PROGRESS_MAX; ++i) {
+        if (i < pos) {
+            printf("#");
+        } else {
+            printf(" ");
+        }
+    }
+    printf("] - %.2f%%\n", percentage * 100);
+}
 
 typedef enum I2C_MasterFlag {
     NONE           = 0x80,
@@ -95,7 +92,6 @@ FT_STATUS FT4222_I2CMaster_Write(
 }
 
 void I2C_burst_write(UINT8 id, UINT8* addr, UINT32 addr_size, UINT8* data, UINT32 data_size) {
-    //UINT8 packet[8], count=0;
     UINT8*    packet;
     UINT32    count           = 0;
     UINT16    sizeTransferred = 0;
@@ -116,10 +112,8 @@ void I2C_burst_write(UINT8 id, UINT8* addr, UINT32 addr_size, UINT8* data, UINT3
     ftStatus = FT4222_I2CMaster_Write(ftdevHandle, id, packet, count, &sizeTransferred);
 
     if (FT4222_OK == ftStatus) {
-        // write data success
-        dbg_printf("I2C_burst_write: write done\n");
+        // dbg_printf("I2C_burst_write: write done\n");
     } else {
-        // write data failed
         dbg_printf("I2C_burst_write: write fail\n");
     }
 
@@ -197,10 +191,8 @@ void I2C_cmd_write_ex(UINT8 id, UINT8* buffer, UINT32 sizeToTransfer, int flag) 
     ftStatus = FT4222_I2CMaster_WriteEx(ftdevHandle, id, flag, buffer, sizeToTransfer, &sizeTransferred);
 
     if (FT4222_OK == ftStatus) {
-        // write data success
-        dbg_printf("I2C_cmd_write_ex: write done\n");
+        // dbg_printf("I2C_cmd_write_ex: write done\n");
     } else {
-        // write data failed
         dbg_printf("I2C_cmd_write_ex: write fail\n");
     }
 }
@@ -234,25 +226,24 @@ void i2c_single_write(unsigned char id, unsigned char* addr, unsigned char* data
     write_packet[5] = addr[2];
     write_packet[7] = addr[3];
 
-    //data size must be 4
+    // data size must be 4
     write_packet[9]  = data[0];
     write_packet[11] = data[1];
     write_packet[13] = data[2];
     write_packet[15] = data[3];
 
-    //address
+    // address
     FT4222_I2CMaster_Write(ftdevHandle, id, write_packet, 2, &sizeTransferred);
     FT4222_I2CMaster_Write(ftdevHandle, id, write_packet + 2, 2, &sizeTransferred);
     FT4222_I2CMaster_Write(ftdevHandle, id, write_packet + 4, 2, &sizeTransferred);
     FT4222_I2CMaster_Write(ftdevHandle, id, write_packet + 6, 2, &sizeTransferred);
 
-    //data
+    // data
     FT4222_I2CMaster_Write(ftdevHandle, id, write_packet + 8, 2, &sizeTransferred);
     FT4222_I2CMaster_Write(ftdevHandle, id, write_packet + 10, 2, &sizeTransferred);
     FT4222_I2CMaster_Write(ftdevHandle, id, write_packet + 12, 2, &sizeTransferred);
     FT4222_I2CMaster_Write(ftdevHandle, id, write_packet + 14, 2, &sizeTransferred);
 
-    //
     FT4222_I2CMaster_Write(ftdevHandle, id, write_ack_packet, 2, &sizeTransferred);
 
     test_time = 0;
@@ -356,22 +347,22 @@ unsigned int i2c_single_read(unsigned char id, unsigned char* addr) {
 #endif
 
     if (no_timeout == 1) {
-        //FT4222_I2CMaster_Read(ftdevHandle, id, &read_packet[8], 2, &sizeTransferred);
+        // FT4222_I2CMaster_Read(ftdevHandle, id, &read_packet[8], 2, &sizeTransferred);
         ftStatus |= FT4222_I2CMaster_WriteEx(ftdevHandle, id, START, &read_packet[8], 1, &sizeTransferred);
         ftStatus |=
           FT4222_I2CMaster_ReadEx(ftdevHandle, id, Repeated_START | STOP, &read_packet[9], 1, &sizeTransferred);
 
-        //FT4222_I2CMaster_Read(ftdevHandle, id, &read_packet[10], 2, &sizeTransferred);
+        // FT4222_I2CMaster_Read(ftdevHandle, id, &read_packet[10], 2, &sizeTransferred);
         ftStatus |= FT4222_I2CMaster_WriteEx(ftdevHandle, id, START, &read_packet[10], 1, &sizeTransferred);
         ftStatus |=
           FT4222_I2CMaster_ReadEx(ftdevHandle, id, Repeated_START | STOP, &read_packet[11], 1, &sizeTransferred);
 
-        //FT4222_I2CMaster_Read(ftdevHandle, id, &read_packet[12], 2, &sizeTransferred);
+        // FT4222_I2CMaster_Read(ftdevHandle, id, &read_packet[12], 2, &sizeTransferred);
         ftStatus |= FT4222_I2CMaster_WriteEx(ftdevHandle, id, START, &read_packet[12], 1, &sizeTransferred);
         ftStatus |=
           FT4222_I2CMaster_ReadEx(ftdevHandle, id, Repeated_START | STOP, &read_packet[13], 1, &sizeTransferred);
 
-        //FT4222_I2CMaster_Read(ftdevHandle, id, &read_packet[14], 2, &sizeTransferred);
+        // FT4222_I2CMaster_Read(ftdevHandle, id, &read_packet[14], 2, &sizeTransferred);
         ftStatus |= FT4222_I2CMaster_WriteEx(ftdevHandle, id, START, &read_packet[14], 1, &sizeTransferred);
         ftStatus |=
           FT4222_I2CMaster_ReadEx(ftdevHandle, id, Repeated_START | STOP, &read_packet[15], 1, &sizeTransferred);
@@ -382,7 +373,7 @@ unsigned int i2c_single_read(unsigned char id, unsigned char* addr) {
         read_packet[15] = 0xFF;
     }
 
-    dbg_printf("i2c_single_read 0x%08X\n", (uint)ftStatus);
+    // dbg_printf("i2c_single_read 0x%08X\n", (uint)ftStatus);
 
     return ((read_packet[15] << 24) | (read_packet[13] << 16) | (read_packet[11] << 8) | (read_packet[9] << 0));
 }
@@ -440,21 +431,26 @@ int ep2_isp_i2c_proc(uint8_t* file_buf, uint32_t file_size) {
 #endif
 
 #if (EPII_VERC_PPDONE == 0x01)
-        //check PP
+        // check PP
         uint32_t pp_stat  = 0;
         uint32_t tmp_addr = ISP_CONTROL_ADDR + ISP_PPDONE_COUNTER_OFFSET;
+
+        int timeout = 0;
 
         do {
             pp_stat = 0x0;
 
             pp_stat = i2c_single_read(CTRL_SLVID, (uint8_t*)&tmp_addr);
 
-            printf("PP_STAT: 0x%08X\n", pp_stat);
+            if (++timeout > 1000) {
+                printf("ERROR: PP_STAT %d\n", pp_stat);
+                return -1;
+            }
 
         } while (!((pp_stat >> 28) == 1 || (pp_stat & 0xFFFFF) == pp_counter_val));
 
 #else
-        //check PP
+        // check PP
         uint32_t pp_stat  = 0;
         uint32_t tmp_addr = ISP_CONTROL_ADDR + ISP_PPDONE_OFFSET;
         do {
@@ -467,11 +463,11 @@ int ep2_isp_i2c_proc(uint8_t* file_buf, uint32_t file_size) {
         } while (!((pp_stat >> 28) == 1 || (pp_stat >> 28) == 2 || (pp_stat >> 28) == 3));
     #endif
 #endif
-        //update progress status
+        // update progress status
         if (upt_val % PROGRESS_STEP == 0) printProgress((double)upt_val / file_size);
-        //update progress status
+        // update progress status
 
-        //CRC Error
+        // CRC Error
         if ((pp_stat >> 28) == 1 || (pp_stat >> 28) == 3) {
             printf("ERROR: PP_STAT %d\n", pp_stat >> 28);
             uint32_t confict_addr = pp_stat & 0x00FFFFFF;
@@ -483,7 +479,7 @@ int ep2_isp_i2c_proc(uint8_t* file_buf, uint32_t file_size) {
             tmp_addr = ISP_CONTROL_ADDR + 0x08;
             crc_rout = i2c_single_read(CTRL_SLVID, (uint8_t*)&tmp_addr);
 
-            //clear CRC info
+            // clear CRC info
             tmp_addr = ISP_CONTROL_ADDR + ISP_STATUS_CLR_OFFEST;
             i2c_single_read(CTRL_SLVID, (uint8_t*)&tmp_addr);
 
@@ -510,7 +506,7 @@ int ep2_isp_i2c_proc(uint8_t* file_buf, uint32_t file_size) {
         //        tmp_addr = ISP_CONTROL_ADDR + 0x08;
         //        crc_rout = i2c_single_read(CTRL_SLVID, (uint8_t *)&tmp_addr);
 
-        //clear CRC info
+        // clear CRC info
         tmp_addr = ISP_CONTROL_ADDR + ISP_STATUS_CLR_OFFEST;
 
         i2c_single_read(CTRL_SLVID, (uint8_t*)&tmp_addr);
