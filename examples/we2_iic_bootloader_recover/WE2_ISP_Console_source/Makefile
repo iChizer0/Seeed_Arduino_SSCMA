@@ -27,14 +27,14 @@ all: compile
 
 compile: $(EXE)
 
-$(ISP_EXE): ${ISP_OBJ} ${ISP_LIB}
-	$(CC) ${LDFLAGS} ${ISP_OBJ} ${LIB} ${INCLUDE} -o $@
+# $(ISP_EXE): ${ISP_OBJ} ${ISP_LIB}
+# 	$(CC) ${LDFLAGS} ${ISP_OBJ} ${LIB} ${INCLUDE} -o $@
 
 ${ISP_OBJ}: ${OBJDIR}/%.o: ${SRCDIR}/%.c 		
 	$(CC) -c ${CFLAGS} ${CFLAGS} ${INCLUDE} $< -o $@
 	
-${ISP_LIB}: ${ISP_CPP_OBJ}
-	$(CXX) ${ISPLIBLDFLAGS} ${ISP_CPP_OBJ} ${ISP_LINK_LIB} ${INCLUDE} -o $@
+# ${ISP_LIB}: ${ISP_CPP_OBJ}
+# 	$(CXX) ${ISPLIBLDFLAGS} ${ISP_CPP_OBJ} ${ISP_LINK_LIB} ${INCLUDE} -o $@
 		
 ${ISP_CPP_OBJ}: ${OBJDIR}/%.o: ${SRCDIR}/%.cpp 		
 	$(CXX) -c ${CFLAGS} ${CXXFLAGS} ${INCLUDE} $< -o $@	

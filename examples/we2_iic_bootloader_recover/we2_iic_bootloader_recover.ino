@@ -11,7 +11,7 @@ int ep2_isp_i2c_proc(uint8_t* file_buf, uint32_t file_size);
 
 void setup() {
     Serial.begin(115200);
-    Serial.setDebugOutput(true);
+    Serial.setDebugOutput(false);
     Serial.println();
 
     wireInit();
@@ -38,12 +38,14 @@ void loop() {
         ;
 
     switch (c) {
+    case 'Q':
     case 'q':
         reboot();
 
         break;
 
-    case 13:
+    case '\r':
+    case '\n':
         Serial.println("Recovering WE2 bootloader...");
         ep2_isp_i2c_proc((uint8_t*)firmware, firmware_len);
         Serial.println("Done");

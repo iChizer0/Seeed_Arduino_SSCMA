@@ -23,6 +23,7 @@ void wireInit() {
 
     Wire.setTimeOut(100);
     Wire.setClock(400000);
+    Wire.setBufferSize(16 * 1024);
 
     Wire.begin();
 }
@@ -44,6 +45,10 @@ size_t scanWire() {
         } else if (error == 4) {
             printf("Unknow error at address 0x%.2x\n", address);
         }
+    }
+
+    while (Wire.available()) {
+        Wire.read();
     }
 
     return nDevices;
@@ -73,9 +78,12 @@ FT_STATUS FT4222_I2CMaster_Write(
 
     int ret = 0;
 
+    size_t check = sizeToTransfer - 1;
     Wire.beginTransmission(deviceAddress);
-    written = Wire.write(buffer, sizeToTransfer);
-    ret     = Wire.endTransmission(true);
+    for (size_t i = 0; i < sizeToTransfer; ++i) {
+        written += Wire.write((const uint8_t*)buffer + i, size_t{1});
+    }
+    ret = Wire.endTransmission(true);
 
     *sizeTransferred += written;
 
@@ -126,17 +134,17 @@ FT_STATUS FT4222_I2CMaster_WriteEx(
 
     int ret = 0;
 
-    if (flag & START || flag & START_AND_STOP) {
+    size_t check = sizeToTransfer - 1;
+
+    if (flag & START || flag == START_AND_STOP) {
         Wire.beginTransmission(deviceAddress);
     }
 
-    written = Wire.write(buffer, sizeToTransfer);
-
-    if (flag & STOP || flag & START_AND_STOP) {
-        ret = Wire.endTransmission(true);
-    } else {
-        ret = Wire.endTransmission(false);
+    for (size_t i = 0; i < sizeToTransfer; ++i) {
+        written += Wire.write((const uint8_t*)buffer + i, size_t{1});
     }
+
+    ret = Wire.endTransmission((flag & STOP || flag == START_AND_STOP));
 
     *sizeTransferred += written;
 
@@ -153,29 +161,28 @@ FT_STATUS FT4222_I2CMaster_ReadEx(
 
     size_t ret = 0;
 
-    if (flag & START || flag & Repeated_START) {
-        if (flag & STOP) {
-            read_size = Wire.requestFrom(deviceAddress, static_cast<size_t>(sizeToTransfer), static_cast<bool>(true));
-        } else {
-            read_size = Wire.requestFrom(deviceAddress, static_cast<size_t>(sizeToTransfer), static_cast<bool>(false));
+    while (Wire.available()) {
+        printf(".");
+        Wire.read();
+    }
+
+    read_size = Wire.requestFrom(deviceAddress, static_cast<size_t>(sizeToTransfer), static_cast<bool>(flag & STOP));
+
+    int b_8 = -1;
+    while (1) {
+        b_8 = Wire.read();
+        if (b_8 == -1) {
+            printf("Error reading, requested %d, available %d, read %d\n", sizeToTransfer, read_size, read);
+            break;
+        }
+        buffer[read] = static_cast<UINT8>(b_8);
+        read += 1;
+        if (read >= sizeToTransfer) {
+            break;
         }
     }
 
-    size_t size = read_size < sizeToTransfer ? read_size : sizeToTransfer;
-
-    while (Wire.available() && read < size) {
-        buffer[read] = Wire.read();
-        read += 1;
-    }
-
     *sizeTransferred += read;
-
-    if (flag & STOP || flag & START_AND_STOP) {
-        ret = Wire.endTransmission(true);
-    } else {
-        ret = Wire.endTransmission(false);
-    }
-
     if (ret == 0) {
         return FT4222_OK;
     } else {
@@ -250,7 +257,7 @@ void i2c_single_write(unsigned char id, unsigned char* addr, unsigned char* data
 
     test_time = 0;
     while (1) {
-        test_time++;
+        test_time += 1;
         FT4222_I2CMaster_WriteEx(ftdevHandle, id, START, ret_packet, 1, &sizeTransferred);
 
         FT4222_I2CMaster_ReadEx(ftdevHandle, id, Repeated_START | STOP, ret_packet + 1, 1, &sizeTransferred);
@@ -334,7 +341,6 @@ unsigned int i2c_single_read(unsigned char id, unsigned char* addr) {
     while (1) {
         test_time++;
         ftStatus |= FT4222_I2CMaster_WriteEx(ftdevHandle, id, START, ret_packet, 1, &sizeTransferred);
-
         ftStatus |=
           FT4222_I2CMaster_ReadEx(ftdevHandle, id, Repeated_START | STOP, &ret_packet[1], 1, &sizeTransferred);
 
@@ -390,9 +396,10 @@ int ep2_isp_i2c_proc(uint8_t* file_buf, uint32_t file_size) {
     uint32_t val[1];
     val[0] = ISP_REG_DEFAULT_VAL;
 
+    // S|50|W|ACK|D8|ACK|-|03|ACK|P
     I2C_burst_write(CTRL_SLVID, (uint8_t*)&reg_addr_scu, 1, (uint8_t*)&val_scu, 1);
 
-    for (uint32_t i = 0; i < sizeof(reg_addr) / sizeof(uint32_t); i++) {
+    for (uint32_t i = 0; i < sizeof(reg_addr) / sizeof(uint32_t); ++i) {
         i2c_single_write(CTRL_SLVID, (uint8_t*)&reg_addr[i], (uint8_t*)&val[i]);
     }
 
@@ -441,6 +448,8 @@ int ep2_isp_i2c_proc(uint8_t* file_buf, uint32_t file_size) {
             pp_stat = 0x0;
 
             pp_stat = i2c_single_read(CTRL_SLVID, (uint8_t*)&tmp_addr);
+
+            printf("PP_STAT: 0x%08X\n", pp_stat);
 
         } while (!((pp_stat >> 28) == 1 || (pp_stat & 0xFFFFF) == pp_counter_val));
 
