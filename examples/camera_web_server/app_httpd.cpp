@@ -15,15 +15,19 @@
 // Modified by Seeed Technology Inc, nullptr (c) 2024
 //
 
+#include <ArduinoJson.h>
 #include <FreeRTOS.h>
 #include <Seeed_Arduino_SSCMA.h>
 #include <freertos/semphr.h>
 #include <mbedtls/base64.h>
+#include <HardwareSerial.h>
 
 #include <deque>
 #include <memory>
 #include <utility>
+#include <vector>
 
+#include "BYTETracker.h"
 #include "camera_index.h"
 #include "esp32-hal-ledc.h"
 #include "esp_camera.h"
@@ -41,6 +45,7 @@
 #define CMD_TIMEOUT_MS    3000
 
 #define PTR_BUFFER_SIZE   8
+#define RSP_BUFFER_SIZE   (1024 * 196)
 #define JPG_BUFFER_SIZE   (1024 * 128)
 #define RST_BUFFER_SIZE   (1024 * 128)
 #define QRY_BUFFER_SIZE   (1024 * 16)
@@ -204,9 +209,18 @@ static void proxyCallback(const char* resp, size_t len) {
     log_i("Received %u bytes...", len);
 }
 
+
+
 void startRemoteProxy() {
-    SPI.begin(SCK, MOSI, MISO, -1);
-    AI.begin(&SPI, D1, D0, D3, 15000000);
+    // SPI.begin(SCK, MOSI, MISO, -1);
+    // AI.begin(&SPI, D1, D0, D3, 15000000);
+
+    // HardwareSerial HWSerial(0);
+     Serial1.begin(115200);
+     Serial1.setRxBufferSize(32 * 1024);
+
+    
+    AI.begin(&Serial1, D3);
 
     const char* cmd = CMD_PREFIX "INVOKE=-1,0,0" CMD_SUFFIX;
     AI.write(cmd, strlen(cmd));
@@ -758,6 +772,181 @@ static esp_err_t stream_handler(httpd_req_t* req) {
     return res;
 }
 
+static esp_err_t stream_handler2(httpd_req_t* req) {
+    esp_err_t                        res = ESP_OK;
+    JsonDocument                     response;
+    BYTETracker                      tracker;
+    std::vector<BYTETracker::Object> boxes_list;
+    static size_t                    last_id = 0;
+    static char*                     rsp_buf = NULL;
+    if (rsp_buf == NULL) {
+        rsp_buf = (char*)malloc(RSP_BUFFER_SIZE);
+        if (rsp_buf == NULL) {
+            log_e("Failed to allocate response buffer...");
+            httpd_resp_send_500(req);
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    res |= httpd_resp_set_status(req, HTTPD_200);
+    res |= httpd_resp_set_type(req, "application/json");
+    res |= httpd_resp_set_hdr(req, "Connection", "keep-alive");
+    res |= httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    if (res != ESP_OK) {
+        log_e("Failed to set response headers...");
+        return res;
+    }
+
+    while (res == ESP_OK) {
+        std::shared_ptr<PtrBuffer::Slot> slot = nullptr;
+
+        xSemaphoreTake(PB.mutex, portMAX_DELAY);
+        auto slots = PB.slots;
+        xSemaphoreGive(PB.mutex);
+
+        for (auto it = slots.rbegin(); it != slots.rend(); ++it) {
+            if (it->get()->id <= last_id) {
+                break;
+            }
+            if (it->get()->type == (MSG_TYPE_EVENT | CMD_TYPE_SAMPLE) ||
+                it->get()->type == (MSG_TYPE_EVENT | CMD_TYPE_INVOKE)) {
+                slot    = *it;
+                last_id = slot->id;
+                break;
+            }
+        }
+
+        if (!slot) {
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        switch (slot->type) {
+        case MSG_TYPE_EVENT | CMD_TYPE_SAMPLE: {
+            res = httpd_resp_send(req, (const char*)slot->data, slot->size);
+            break;
+        }
+
+        case MSG_TYPE_EVENT | CMD_TYPE_INVOKE: {
+            response.clear();
+            DeserializationError err = deserializeJson(response, (const char*)slot->data, slot->size);
+            if (err != DeserializationError::Ok) {
+                log_e("Failed to parse json...");
+                break;
+            }
+
+            if (!response.containsKey("data")) {
+                log_e("No data found in json...");
+                break;
+            }
+
+            boxes_list.clear();
+            if (response["data"].containsKey("boxes")) {
+                JsonArray boxes = response["data"]["boxes"];
+                for (JsonVariant box : boxes) {
+                    if (box.size() != 6) {
+                        log_w("Invalid box size...");
+                        continue;
+                    }
+                    BYTETracker::Object cxcywh;
+                    cxcywh.rect.x      = box[0];
+                    cxcywh.rect.y      = box[1];
+                    cxcywh.rect.width  = box[2];
+                    cxcywh.rect.height = box[3];
+                    cxcywh.label       = box[5];
+                    cxcywh.prob        = box[4];
+                    boxes_list.push_back(cxcywh);
+                }
+
+                std::vector<STrack> output_stracks = tracker.update(boxes_list);
+
+                boxes.clear();
+                for (STrack& strack : output_stracks) {
+                    JsonDocument doc;
+                    JsonArray    box = doc.to<JsonArray>();
+                    box.add(static_cast<int32_t>(strack.tlwh[0]));
+                    box.add(static_cast<int32_t>(strack.tlwh[1]));
+                    box.add(static_cast<int32_t>(strack.tlwh[2]));
+                    box.add(static_cast<int32_t>(strack.tlwh[3]));
+                    box.add(static_cast<int32_t>(strack.score));
+                    box.add(static_cast<int32_t>(strack.label));
+                    box.add(static_cast<int32_t>(strack.track_id));
+                    boxes.add(box);
+                }
+
+            } else if (response["data"].containsKey("keypoints")) {
+                JsonArray keypoints = response["data"]["keypoints"];
+
+                size_t id = 0;
+                for (JsonVariant keypoint : keypoints) {
+                    if (keypoint.size() != 2) {
+                        log_w("Invalid keypoint size...");
+                        continue;
+                    }
+                    JsonArray box = keypoint[0];
+                    if (box.size() != 6) {
+                        log_w("Invalid box size...");
+                        continue;
+                    }
+                    BYTETracker::Object cxcywh;
+                    cxcywh.rect.x      = box[0];
+                    cxcywh.rect.y      = box[1];
+                    cxcywh.rect.width  = box[2];
+                    cxcywh.rect.height = box[3];
+                    cxcywh.label       = box[5];
+                    cxcywh.prob        = box[4];
+
+                    static_assert(sizeof(cxcywh.label) == 4);
+                    cxcywh.label = id++ << 16 | (cxcywh.label & 0xffff);
+                    box[5]       = cxcywh.label;
+
+                    boxes_list.push_back(cxcywh);
+                }
+
+                std::vector<STrack> output_stracks = tracker.update(boxes_list);
+
+                for (JsonVariant keypoint : keypoints) {
+                    JsonArray box   = keypoint[0];
+                    int       label = box[5];
+
+                    auto it = std::find_if(output_stracks.begin(), output_stracks.end(), [label](const STrack& strack) {
+                        return strack.label == label;
+                    });
+                    if (it != output_stracks.end()) {
+                        box[0] = static_cast<int32_t>(it->tlwh[0]);
+                        box[1] = static_cast<int32_t>(it->tlwh[1]);
+                        box[2] = static_cast<int32_t>(it->tlwh[2]);
+                        box[3] = static_cast<int32_t>(it->tlwh[3]);
+                        box[4] = static_cast<int32_t>(it->score);
+                        box[5] = static_cast<int32_t>(it->label & 0xffff);
+                        box.add(static_cast<int32_t>(it->track_id));
+
+                        output_stracks.erase(it);
+                    } else {
+                        box[5] = static_cast<int32_t>(label & 0xffff);
+                        box.add(0);
+                    }
+                }
+            }
+
+            size_t len = serializeJson(response, rsp_buf, RSP_BUFFER_SIZE);
+            res        = httpd_resp_send_chunk(req, rsp_buf, len);
+
+            break;
+        }
+
+        default:;
+        }
+
+        if (res != ESP_OK) {
+            log_e("Send results failed...");
+            break;
+        }
+    }
+
+    return res;
+}
+
 static esp_err_t parse_get(httpd_req_t* req, char** obuf) {
     char*  buf     = NULL;
     size_t buf_len = 0;
@@ -1224,7 +1413,7 @@ void startCameraServer() {
 
     httpd_uri_t stream_uri = {.uri      = "/stream",
                               .method   = HTTP_GET,
-                              .handler  = stream_handler,
+                              .handler  = stream_handler2,
                               .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
                               ,

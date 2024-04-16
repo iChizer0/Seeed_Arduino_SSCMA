@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+
+<body>
+    <h1>HTML5 Canvas</h1>
+
+    <p>Image to use:</p>
+
+    <img id="scream" width="320" height="240" src="http://10.17.0.15:8080/stream" alt="The Scream">
+
+    <p>Canvas:</p>
+
+    <canvas id="myCanvas" width="320" height="240" style="border:1px solid grey;"></canvas>
+
+    <script>
+        window.onload = function () {
+            const canvas = document.getElementById("myCanvas");
+            const ctx = canvas.getContext("2d");
+            const img = document.getElementById("scream");
+            ctx.drawImage(img, 10, 10);
+        };
+    </script>
+
+</body>
+
+</html>
