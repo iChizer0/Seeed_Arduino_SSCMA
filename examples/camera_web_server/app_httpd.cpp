@@ -15,13 +15,17 @@
 // Modified by nullptr, Seeed Technology Inc (c) 2024
 //
 
+#include "app_httpd.h"
+
 #include <ArduinoJson.h>
 #include <FreeRTOS.h>
-#include <HardwareSerial.h>
 #include <Seeed_Arduino_SSCMA.h>
 #include <Wire.h>
+#include <esp_http_server.h>
+#include <esp_timer.h>
 #include <freertos/semphr.h>
 #include <mbedtls/base64.h>
+#include <sdkconfig.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -31,13 +35,11 @@
 #include <vector>
 
 #include "BYTETracker.h"
-#include "esp_http_server.h"
-#include "esp_timer.h"
-#include "sdkconfig.h"
 #include "web_index.h"
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
-    #include "esp32-hal-log.h"
+    #include <HardwareSerial.h>
+    #include <esp32-hal-log.h>
 #endif
 
 #define RESULT_TIMEOUT_MS 3000
@@ -112,6 +114,44 @@ void initStatInfo() {
     SI.last_frame_timestamp.tv_usec = (ticks % configTICK_RATE_HZ) * 1e6 / configTICK_RATE_HZ;
 }
 
+void startRemoteProxy(Proto through = PROTO_UART) {
+    switch (through) {
+    case PROTO_UART: {
+#ifdef ESP32
+        static HardwareSerial atSerial(0);
+        // the esp32 arduino library may have a bug in setRxBufferSize
+        // we cannot set the buffer size larger than uint16_t max value
+        // a workaround is to modify uartBegin() in
+        //     esp32/hardware/esp32/2.0.14/cores/esp32/esp32-hal-uart.c
+        atSerial.setRxBufferSize(128 * 1024);
+        atSerial.begin(921600);
+#else
+    #define atSerial Serial1
+        atSerial.setRxBufferSize(128 * 1024);
+        atSerial.begin(921600);
+#endif
+        AI.begin(&atSerial, D3);
+        break;
+    }
+    case PROTO_I2C: {
+        Wire.setBufferSize(128 * 1024);
+        Wire.begin();
+        AI.begin(&Wire, D3);
+        break;
+    };
+    case PROTO_SPI: {
+        SPI.begin(SCK, MOSI, MISO, -1);
+        AI.begin(&SPI, D1, D0, D3, 15000000);
+        break;
+    };
+    default:
+        assert(false && "Unknown proto...");
+    }
+
+    const char* cmd = CMD_PREFIX "INVOKE=-1,0,0" CMD_SUFFIX;
+    AI.write(cmd, strlen(cmd));
+}
+
 inline uint16_t getMsgType(const char* resp, size_t len) {
     uint16_t type = MSG_TYPE_UNKNOWN;
 
@@ -135,8 +175,6 @@ inline uint16_t getCmdType(const char* resp, size_t len) {
         type |= CMD_TYPE_SAMPLE;
     } else if (strnstr(resp, CMD_INVOKE_STR, len) != NULL) {
         type |= CMD_TYPE_INVOKE;
-    } else {
-        log_w("Unknown command type...");
     }
 
     return type;
@@ -204,23 +242,6 @@ static void proxyCallback(const char* resp, size_t len) {
     }
 
     log_i("Received %u bytes...", len);
-}
-
-void startRemoteProxy() {
-    SPI.begin(SCK, MOSI, MISO, -1);
-    AI.begin(&SPI, D1, D0, D3, 15000000);
-
-    // HardwareSerial HWSerial(0);
-    // Serial1.setRxBufferSize(32 * 1024);
-    //  Serial1.begin(115200);
-    // Wire.setBufferSize(32 * 1024);
-    // Wire.begin();
-    // Wire.setBufferSize(32 * 1024);
-
-    // AI.begin(&Wire, D3);
-
-    const char* cmd = CMD_PREFIX "INVOKE=-1,0,0" CMD_SUFFIX;
-    AI.write(cmd, strlen(cmd));
 }
 
 void loopRemoteProxy() { AI.fetch(proxyCallback); }
@@ -779,12 +800,12 @@ static esp_err_t command_handler(httpd_req_t* req) {
     free(cmd_buf);
     AI.write(CMD_SUFFIX, strlen(CMD_SUFFIX));
 
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-
     std::shared_ptr<PtrBuffer::Slot> slot = nullptr;
 
     TickType_t time_begin = xTaskGetTickCount();
     while ((xTaskGetTickCount() - time_begin) < (RESULT_TIMEOUT_MS / portTICK_PERIOD_MS)) {
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+
         xSemaphoreTake(PB.mutex, portMAX_DELAY);
         auto slots = PB.slots;
         xSemaphoreGive(PB.mutex);
@@ -805,7 +826,6 @@ static esp_err_t command_handler(httpd_req_t* req) {
             return false;
         });
         if (it == slots.end()) {
-            vTaskDelay(5 / portTICK_PERIOD_MS);
             continue;
         }
 
